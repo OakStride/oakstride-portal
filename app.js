@@ -21,6 +21,8 @@
     draft_ready: "Förslag klart — granska",
     approved: "Godkänt",
     waiting_customer: "Väntar på dig",
+    publishing: "Publicerar…",
+    published: "Publicerad — live",
     done: "Klar"
   };
   var STATUS_LABELS_ADMIN = {
@@ -30,6 +32,8 @@
     draft_ready: "Förslag klart",
     approved: "Godkänt av kund",
     waiting_customer: "Väntar på kund",
+    publishing: "Publicerar…",
+    published: "Publicerad (kund lanserade direkt)",
     done: "Klar"
   };
   var PRIO_LABELS = { low: "Låg", normal: "Normal", high: "Hög" };
