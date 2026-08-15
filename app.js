@@ -1294,6 +1294,9 @@
   function afterAISend(cp, rr) {
     if (rr && rr.data && rr.data.ok === false && rr.data.error === "monthly_cap") {
       toast("Månadsgränsen för AI-ändringar är nådd — skapa ett ärende under Support så hjälper vi dig manuellt.", true);
+    } else if (rr && (rr.error || (rr.data && rr.data.ok === false))) {
+      // Svälj aldrig fel tyst — annars ser kunden "AI:n arbetar…" för evigt (bugg hittad 2026-08-15).
+      toast("AI-assistenten kunde inte startas: " + ((rr.error && rr.error.message) || (rr.data && rr.data.error) || "okänt fel") + ". Ditt meddelande är sparat — OakStride tittar på det.", true);
     }
     var ta = document.getElementById("aichat-msg"); if (ta) ta.value = "";
     loadAIChat(cp);
