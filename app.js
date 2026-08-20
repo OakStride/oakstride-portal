@@ -593,6 +593,7 @@
     var c = actingCustomers.filter(function (x) { return x.id === uid; })[0];
     if (!c) return;
     actingUid = uid; actingProfile = c;
+    aiChatActiveId = null;   // "__new__" självläker inte — annars visas nästa kunds chatt som tom
     renderCustomer();
   }
   // Lämna "agera som kund"-läget och gå tillbaka till adminvyn.
@@ -1048,8 +1049,8 @@
         '<div class="siteband">' +
           '<span class="siteband-fav"></span>' +
           '<div class="siteband-info"><span class="siteband-dom">' + esc(site || "din sajt") + '</span>' +
-            (siteUrl ? '<span class="siteband-st">&#9679; Live</span>' : '<span class="siteband-st muted">Kopplas av OakStride</span>') + "</div>" +
-          (siteUrl ? '<a class="btn btn-ghost btn-inline siteband-btn" href="' + esc(siteUrl) + '" target="_blank" rel="noopener">Förhandsgranska hela sajten &#8599;</a>' : "") +
+            (siteUrl ? '<span class="siteband-st">&#9679; Live</span>' : '<span class="siteband-st muted" id="sb-st">Kopplas av OakStride</span>') + "</div>" +
+          (siteUrl ? '<a class="btn btn-ghost btn-inline siteband-btn" href="' + esc(siteUrl) + '" target="_blank" rel="noopener">Förhandsgranska hela sajten &#8599;</a>' : '<span id="sb-act"></span>') +
         "</div>" +
         '<div id="aichat" class="aichat"><div class="spinner"></div></div>' +
         '<details class="upd-images"><summary class="upd-images-sum">📷 Mina bilder</summary><div id="uploads-box"></div></details>' +
@@ -1133,17 +1134,28 @@
 
   function loadAIChat(cp) {
     var box = document.getElementById("aichat"); if (!box) return;
+    // Måste rensas här och inte bara i loadAIChatThread: utan aktivt ärende renderas ingen tråd,
+    // och en kvarlevande timer river textarean under kunden mitt i skrivandet efter 6 s.
+    clearTimeout(aiPollTimer);
     sb.from("requests").select("*").eq("user_id", cp.id).order("updated_at", { ascending: false }).then(function (res) {
       if (!box.isConnected) return;
       var reqs = res.error ? [] : (res.data || []);
       var active = null;
-      if (aiChatActiveId && aiChatActiveId !== "__new__") active = reqs.filter(function (r) { return r.id === aiChatActiveId; })[0] || null;
+      // requests.id är bigint → tal i JS, medan data-openreq ger en sträng. Strängjämför,
+      // annars faller klicket i "Tidigare ändringar" igenom till autovalet nedan (live-bugg i v=82).
+      if (aiChatActiveId && aiChatActiveId !== "__new__") active = reqs.filter(function (r) { return String(r.id) === String(aiChatActiveId); })[0] || null;
       if (!active && aiChatActiveId !== "__new__") active = reqs.filter(function (r) { return ["done", "published", "approved"].indexOf(r.status) < 0; })[0] || null;
       aiChatActiveId = active ? active.id : aiChatActiveId;
       var others = reqs.filter(function (r) { return !active || r.id !== active.id; });
       box.innerHTML =
         '<div class="card aichat-card">' +
-          '<div class="aichat-head"><span class="aichat-ai">🤖</span><span class="aichat-ttl">Din AI-assistent</span><span class="aichat-live">Redo</span></div>' +
+          '<div class="aichat-head"><span class="aichat-ai">🤖</span><span class="aichat-ttl">Din AI-assistent</span>' +
+            // Utan knappen fastnar kunden i ett ärende som hänger i new/in_progress: sendAIChat
+            // lägger då varje nytt meddelande som kommentar på det gamla ärendet i stället.
+            (active && ["new", "in_progress"].indexOf(active.status) >= 0
+              ? '<button type="button" class="btn btn-ghost btn-sm aichat-newbtn" id="aichat-new">+ Ny ändring</button>'
+              : '<span class="aichat-live">Redo</span>') +
+          '</div>' +
           '<div class="aichat-thread" id="aichat-thread">' +
             (active ? '<div class="spinner"></div>' : '<div class="aichat-empty"><p>👋 Hej! Vad vill du ändra på din sajt idag? Beskriv med egna ord — t.ex. <em>&quot;byt öppettiderna till 9–18&quot;</em> — så tar jag fram ett utkast du kan förhandsgranska och publicera.</p></div>') +
           "</div>" +
@@ -1159,6 +1171,8 @@
           '<div class="aichat-usage" id="aichat-usage"></div>' +
         "</div>";
       document.getElementById("aichat-form").addEventListener("submit", function (e) { e.preventDefault(); sendAIChat(cp, active); });
+      var nb = document.getElementById("aichat-new");
+      if (nb) nb.addEventListener("click", function () { aiChatActiveId = "__new__"; loadAIChat(cp); });
       var att = document.getElementById("aichat-attach");
       if (att) att.addEventListener("click", function () {
         var d = document.querySelector(".upd-images"); if (d) { d.open = true; d.scrollIntoView({ behavior: "smooth", block: "nearest" }); }
@@ -1306,6 +1320,20 @@
     loadAIChat(cp);
   }
 
+  // Sitebandet i "Uppdatera sajten": kund UTAN ifylld profiles.website fick
+  // "Kopplas av OakStride" även när det redan fanns en delad förhandsvisning — sajten såg
+  // ogjord ut för kunden. Har kunden en preview visas den i stället, med länk.
+  // Körs bara när website saknas; har kunden en domain är bandet redan rätt.
+  // Anropas av loadDraft med den preview den redan hämtat — ingen egen query, samma rad.
+  function fyllSiteBand(url) {
+    var st = document.getElementById("sb-st"); if (!st || !st.isConnected || !url) return;
+    st.className = "siteband-st";
+    st.innerHTML = "&#9679; Förhandsvisning klar";
+    var act = document.getElementById("sb-act");
+    if (act) act.outerHTML = '<a class="btn btn-ghost btn-inline siteband-btn" href="' + esc(url) +
+      '" target="_blank" rel="noopener">Öppna förhandsvisningen &#8599;</a>';
+  }
+
   // Delat webbplatsutkast (från "Bygg sajt"/agenten) i kundvyn
   function loadDraft(customerId) {
     var box = document.getElementById("draft-box");
@@ -1313,9 +1341,12 @@
     sb.from("build_jobs").select("preview_url, shared_at").eq("customer_id", customerId)
       .not("shared_at", "is", null).order("shared_at", { ascending: false }).limit(1)
       .then(function (res) {
-        if (res.error || !res.data || !res.data.length) return;
+        if (res.error) { if (window.console) console.warn("loadDraft:", res.error.message); return; }
+        if (!res.data || !res.data.length) return;
         var j = res.data[0];
         if (!j.preview_url) return;
+        fyllSiteBand(j.preview_url);   // sitebandet på "Uppdatera sajten" — samma rad, ingen extra query
+        if (!box.isConnected) return;
         box.innerHTML =
           '<div class="card" style="border:2px solid #1e3a2f;margin-bottom:1.2rem">' +
           '<div class="page-head"><h2 style="margin:0">&#10024; Ditt webbplatsutkast är klart!</h2></div>' +
