@@ -23,9 +23,11 @@
     waiting_customer: "Väntar på dig",
     publishing: "Publicerar…",
     published: "Publicerad — live",
-    done: "Klar"
+    done: "Klar",
+    failed: "Vi tittar på det"
   };
   var STATUS_LABELS_ADMIN = {
+    failed: "MISSLYCKADES — ta över",
     new: "Ny",
     in_progress: "Pågående",
     questions: "Väntar på kundsvar",
@@ -1128,7 +1130,7 @@
   var aiChatActiveId = null;
   var aiPollTimer = null;
   function statusPill(st) {
-    var m = ({ published: ["LIVE", "live"], done: ["KLAR", "live"], approved: ["GRANSKAS", "rev"], draft_ready: ["UTKAST KLART", "rev"], publishing: ["PUBLICERAR", "rev"], questions: ["FRÅGA", "rev"], "new": ["PÅGÅR", "rev"], in_progress: ["PÅGÅR", "rev"] })[st] || ["PÅGÅR", "rev"];
+    var m = ({ published: ["LIVE", "live"], done: ["KLAR", "live"], approved: ["GRANSKAS", "rev"], draft_ready: ["UTKAST KLART", "rev"], publishing: ["PUBLICERAR", "rev"], failed: ["MISSLYCKADES", "rev"], questions: ["FRÅGA", "rev"], "new": ["PÅGÅR", "rev"], in_progress: ["PÅGÅR", "rev"] })[st] || ["PÅGÅR", "rev"];
     return '<span class="hpill ' + m[1] + '">' + m[0] + "</span>";
   }
 
@@ -1248,6 +1250,7 @@
       else if (st === "questions") sm = "💬 AI:n har en fråga — svara nedan så fortsätter den.";
       else if (st === "new" || st === "in_progress") sm = "⏳ AI:n arbetar på din ändring… det kan ta några minuter. Tryck ↻ Uppdatera.";
       else if (st === "publishing") sm = "🚀 Publicerar din ändring… det tar en minut. Tryck ↻ Uppdatera.";
+      else if (st === "failed") sm = "🛠️ Något gick inte som det skulle. OakStride har fått besked och tittar på det — du behöver inte göra något.";
       else if (st === "published") sm = "🎉 Ändringen är live på din sajt!";
       else if (st === "approved") sm = "👍 Skickad till OakStride — vi granskar och publicerar.";
       thread.innerHTML = html + draftHtml + (sm ? '<div class="aichat-status">' + sm + "</div>" : "");
