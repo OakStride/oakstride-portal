@@ -1,3 +1,14 @@
+-- ============================================================================
+-- ⚠️ ÖVERSPELAD — KÖR INTE DEN HÄR FILEN RAKT AV EFTER MIGRATION 25
+--
+-- Filen innehåller en KOMPLETT `create or replace` av notify_email(). Migration 25 lade till
+-- en gren för statusvärdet `failed` som INTE finns här. Körs den här filen om försvinner den
+-- grenen tyst, och kunden får fel besked när en publicering misslyckas.
+--
+-- Behöver du ändå köra den: kör migration 25 direkt efteråt. Den är idempotent och lägger
+-- tillbaka grenen.
+-- ============================================================================
+
 -- Migration 23 (2026-08-16): BUGFIX kundmejl vid systemkommentar.
 -- notify_email() skickade ALLA kommentarer med author_id is null (= agentens/systemets
 -- kommentarer) som "Ny fråga om ditt ärende #N" / "<h2>Vi behöver din input</h2>",

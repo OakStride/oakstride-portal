@@ -23,9 +23,11 @@
     waiting_customer: "Väntar på dig",
     publishing: "Publicerar…",
     published: "Publicerad — live",
-    done: "Klar"
+    done: "Klar",
+    failed: "Vi tittar på det"
   };
   var STATUS_LABELS_ADMIN = {
+    failed: "MISSLYCKADES — ta över",
     new: "Ny",
     in_progress: "Pågående",
     questions: "Väntar på kundsvar",
@@ -1128,7 +1130,7 @@
   var aiChatActiveId = null;
   var aiPollTimer = null;
   function statusPill(st) {
-    var m = ({ published: ["LIVE", "live"], done: ["KLAR", "live"], approved: ["GRANSKAS", "rev"], draft_ready: ["UTKAST KLART", "rev"], publishing: ["PUBLICERAR", "rev"], questions: ["FRÅGA", "rev"], "new": ["PÅGÅR", "rev"], in_progress: ["PÅGÅR", "rev"] })[st] || ["PÅGÅR", "rev"];
+    var m = ({ published: ["LIVE", "live"], done: ["KLAR", "live"], approved: ["GRANSKAS", "rev"], draft_ready: ["UTKAST KLART", "rev"], publishing: ["PUBLICERAR", "rev"], failed: ["MISSLYCKADES", "rev"], questions: ["FRÅGA", "rev"], "new": ["PÅGÅR", "rev"], in_progress: ["PÅGÅR", "rev"] })[st] || ["PÅGÅR", "rev"];
     return '<span class="hpill ' + m[1] + '">' + m[0] + "</span>";
   }
 
@@ -1144,7 +1146,7 @@
       // requests.id är bigint → tal i JS, medan data-openreq ger en sträng. Strängjämför,
       // annars faller klicket i "Tidigare ändringar" igenom till autovalet nedan (live-bugg i v=82).
       if (aiChatActiveId && aiChatActiveId !== "__new__") active = reqs.filter(function (r) { return String(r.id) === String(aiChatActiveId); })[0] || null;
-      if (!active && aiChatActiveId !== "__new__") active = reqs.filter(function (r) { return ["done", "published", "approved"].indexOf(r.status) < 0; })[0] || null;
+      if (!active && aiChatActiveId !== "__new__") active = reqs.filter(function (r) { return ["done", "published", "approved", "failed"].indexOf(r.status) < 0; })[0] || null;
       aiChatActiveId = active ? active.id : aiChatActiveId;
       var others = reqs.filter(function (r) { return !active || r.id !== active.id; });
       box.innerHTML =
@@ -1152,7 +1154,7 @@
           '<div class="aichat-head"><span class="aichat-ai">🤖</span><span class="aichat-ttl">Din AI-assistent</span>' +
             // Utan knappen fastnar kunden i ett ärende som hänger i new/in_progress: sendAIChat
             // lägger då varje nytt meddelande som kommentar på det gamla ärendet i stället.
-            (active && ["new", "in_progress"].indexOf(active.status) >= 0
+            (active && ["new", "in_progress", "failed"].indexOf(active.status) >= 0
               ? '<button type="button" class="btn btn-ghost btn-sm aichat-newbtn" id="aichat-new">+ Ny ändring</button>'
               : '<span class="aichat-live">Redo</span>') +
           '</div>' +
@@ -1248,6 +1250,7 @@
       else if (st === "questions") sm = "💬 AI:n har en fråga — svara nedan så fortsätter den.";
       else if (st === "new" || st === "in_progress") sm = "⏳ AI:n arbetar på din ändring… det kan ta några minuter. Tryck ↻ Uppdatera.";
       else if (st === "publishing") sm = "🚀 Publicerar din ändring… det tar en minut. Tryck ↻ Uppdatera.";
+      else if (st === "failed") sm = "🛠️ Något gick inte som det skulle. OakStride har fått besked och tittar på det — du behöver inte göra något.";
       else if (st === "published") sm = "🎉 Ändringen är live på din sajt!";
       else if (st === "approved") sm = "👍 Skickad till OakStride — vi granskar och publicerar.";
       thread.innerHTML = html + draftHtml + (sm ? '<div class="aichat-status">' + sm + "</div>" : "");
@@ -1269,7 +1272,7 @@
     var btn = document.querySelector("#aichat-form button"); if (btn) { btn.disabled = true; btn.textContent = "Skickar…"; }
     function fail(m) { toast(m, true); if (btn) { btn.disabled = false; btn.textContent = "Skicka"; } }
     // En avslutad ändring (publicerad/klar/godkänd) → nästa meddelande blir en NY ändring automatiskt.
-    var finished = active && ["published", "done", "approved"].indexOf(active.status) >= 0;
+    var finished = active && ["published", "done", "approved", "failed"].indexOf(active.status) >= 0;
     if (active && aiChatActiveId !== "__new__" && !finished) {
       sb.from("request_comments").insert({ request_id: active.id, author_id: cuid(), body: msg }).then(function (r) {
         if (r.error) return fail("Kunde inte skicka: " + r.error.message);
