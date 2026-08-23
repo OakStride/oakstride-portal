@@ -34,7 +34,7 @@ begin
   if pat is null then return new; end if;
   begin
     perform net.http_post(
-      url := 'https://api.github.com/repos/Lifewaver/oakstride-agent/dispatches',
+      url := 'https://api.github.com/repos/OakStride/oakstride-agent/dispatches',
       body := jsonb_build_object(
         'event_type', 'claude-draft',
         'client_payload', jsonb_build_object('request_id', new.request_id, 'reason', new.reason)
