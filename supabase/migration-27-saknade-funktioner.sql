@@ -1,9 +1,27 @@
 -- Migration 27: skriv ned det som fanns i produktion men saknades i repot
 --
--- ⚠️ LÄS DETTA FÖRST: den här filen ÄNDRAR EN SAK I DRIFT, med flit.
--- Version 1 av filen påstod "ändrar ingenting i drift". Granskaren underkände den med fyra
--- blockerande fynd, och de var riktiga. Det här är omtaget. Se avsnitt 5 nedan för den enda
--- avsiktliga beteendeändringen: publiceringsloopen.
+-- ⚠️ LÄS DETTA FÖRST: den här filen ändrar INGENTING i drift — och den gången är det mätt.
+--
+-- Version 1 påstod samma sak utan belägg. Version 2 lade till en loopfix och kallade den
+-- "den enda avsiktliga beteendeändringen". Granskaren underkände båda. Version 2 hade
+-- dessutom TVÅ oavsiktliga ändringar som jag inte sett:
+--   * triggern skrevs `after update OF STATUS` — drift har `after update` utan kolumnlista
+--   * loopfixen fixade inte loopen (se nedan)
+--
+-- Uppmätt mot drift 2026-08-23 innan v3 skrevs:
+--   pg_get_triggerdef('build_jobs_publish_dispatch') -> AFTER UPDATE ON public.build_jobs
+--                                                       FOR EACH ROW EXECUTE FUNCTION
+--                                                       dispatch_publish_site()
+--   proowner('rls_auto_enable')  -> postgres  (create or replace fungerar)
+--   rolsuper(current_user)       -> FALSE     (create event trigger gar INTE)
+--
+-- 🔴 LOOPFIXEN LIGGER INTE HÄR. Den hör hemma i `publish-site.yml`, inte i databasen.
+-- Loopens motor är att workflowet SJÄLV PATCH:ar status='publishing' i sitt första steg.
+-- Portalen har redan satt det värdet när knappen trycks — workflowets PATCH är redundant,
+-- och det är den som föder nästa körning. Ett villkor i triggern kan inte skilja *portalen
+-- som startar* från *workflowet som rapporterar in sig själv*: båda skriver samma värde.
+-- Granskaren visade att v2:s villkor bara flyttade loopen till felvägen (`publish_failed`).
+-- Fixen ligger i agent-repot som en egen PR.
 --
 -- BAKGRUND
 -- 2026-08-23 upptäcktes att `dispatch_publish_site` fanns i drift men saknade migrationsfil.
@@ -108,12 +126,20 @@ begin
     from pg_event_trigger e where e.evtname = 'ensure_rls';
 
   if not found then
-    create event trigger ensure_rls
-      on ddl_command_end
-      when tag in ('CREATE TABLE', 'CREATE TABLE AS', 'SELECT INTO')
-      execute function public.rls_auto_enable();
-    raise notice 'Event-triggern ensure_rls skapad.';
-    return;
+    -- ⛔ VI KAN INTE SKAPA DEN. `create event trigger` kraver SUPERUSER, och projektets
+    -- postgres-roll ar det inte. Uppmatt 2026-08-23: rolsuper = false.
+    -- Version 2 av filen forsokte skapa den anda. Den grenen hade havererat i precis det
+    -- scenario filen sager sig losa - en ateruppbyggnad - och tagit hela migrationen med
+    -- sig, eftersom kor-migrationer.yml kor med psql -1.
+    -- Darfor: larma hogljutt i stallet for att latsas losa det.
+    raise exception E'Migration 27: event-triggern ensure_rls SAKNAS, och den kan inte '
+      'skapas harifran - det kraver superuser.\n'
+      'Konsekvens: nya tabeller i public far INGEN RLS, och ar da lasbara for varje '
+      'inloggad kund.\n'
+      'Atgard: kor foljande i Supabases SQL-editor, som har hogre rattigheter:\n'
+      '  create event trigger ensure_rls on ddl_command_end\n'
+      '    when tag in (''CREATE TABLE'', ''CREATE TABLE AS'', ''SELECT INTO'')\n'
+      '    execute function public.rls_auto_enable();';
   end if;
 
   if r.evtfoid <> 'public.rls_auto_enable'::regproc then
@@ -121,7 +147,7 @@ begin
       'public.rls_auto_enable. RLS-skyddet ar da inte det vi tror. Reds ut for hand.',
       r.evtfoid::regproc;
   end if;
-  if r.evtenabled = 'D' then
+  if r.evtenabled in ('D', 'R') then  -- D = disabled, R = replica (fyrar inte pa primaren)
     raise exception 'Migration 27: event-triggern ensure_rls finns men ar AVSTANGD. Nya '
       'tabeller far da ingen RLS. Sla pa den med: alter event trigger ensure_rls enable;';
   end if;
@@ -135,29 +161,13 @@ end
 $ens$;
 
 -- ---------------------------------------------------------------------------
--- 5. dispatch_publish_site — HÄR ÄR DEN ENDA AVSIKTLIGA BETEENDEÄNDRINGEN
+-- 5. dispatch_publish_site — startar go-live nar status blir 'publishing'
 -- ---------------------------------------------------------------------------
--- 🔴 PUBLICERINGSLOOP, observerad i drift 2026-08-23 kl 12:56.
+-- Ordagrant ur drift (pg_get_functiondef 2026-08-23). OFORANDRAD.
 --
--- Sex publiceringskörningar avfyrades på nittio sekunder, ~11 sekunder isär, och fortsatte
--- köa nya tills byggjobbet raderades. Mekaniken:
---
---   publish-site.yml sätter status = 'publishing' i sitt forsta steg
---   publish-site.yml satter status = 'published' nar den ar klar
---   nasta koade korning satter 'publishing' igen -> old = 'published', ny = 'publishing'
---   -> triggern ser en ny overgang och avfyrar ANNU en publicering -> loop
---
--- Det gamla villkoret (`old.status is not distinct from 'publishing'`) skyddar bara mot att
--- samma körning fyrar två gånger. Det skyddar inte mot kedjan ovan.
---
--- FIXEN: dispatcha bara från de statusar portalen faktiskt tillåter publicering från.
--- `app.js` har regeln redan: canPublish kräver status i
--- (preview_ready, changes_requested, approved, publish_failed) — `published` finns INTE med.
--- Triggern speglar nu samma mängd, så databasen och gränssnittet säger samma sak.
---
--- Konsekvens att vara medveten om: en publicering som startas manuellt via workflow_dispatch
--- mot ett redan publicerat jobb dispatchar inte längre vidare. Det är avsikten — den körningen
--- är redan igång, den behöver ingen ny.
+-- 🔴 Den observerade publiceringsloopen fixas INTE har. Se filhuvudet: motorn ar
+-- workflowets egen PATCH till 'publishing', och den ligger i agent-repot. Ett villkor
+-- har kan inte skilja portalen fran workflowet - bada skriver samma varde.
 CREATE OR REPLACE FUNCTION public.dispatch_publish_site()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -170,14 +180,6 @@ begin
   if new.status <> 'publishing' or old.status is not distinct from 'publishing' then
     return new;
   end if;
-  -- ...och bara FRÅN en status portalen tillåter publicering från. Utan detta villkor
-  -- loopar publiceringen: workflowet sätter 'published', nästa körning sätter 'publishing',
-  -- triggern ser en ny övergång, och kedjan går runt. Observerad i drift 2026-08-23.
-  if old.status not in ('preview_ready', 'changes_requested', 'approved', 'publish_failed') then
-    raise log 'dispatch_publish_site: hoppar over % -> publishing (ingen giltig utgangsstatus)', old.status;
-    return new;
-  end if;
-
   select decrypted_secret into pat from vault.decrypted_secrets where name = 'github_pat';
   if pat is null then return new; end if;
   begin
@@ -205,7 +207,7 @@ end; $function$;
 -- Namnet är hämtat ur drift: build_jobs_publish_dispatch.
 drop trigger if exists build_jobs_publish_dispatch on public.build_jobs;
 create trigger build_jobs_publish_dispatch
-  after update of status on public.build_jobs
+  after update on public.build_jobs
   for each row execute function public.dispatch_publish_site();
 
 -- ---------------------------------------------------------------------------
@@ -264,7 +266,7 @@ grant  execute on function public.request_publish_change(bigint) to authenticate
 --   for f in $(psql "$DB_URL" -t -A -c "select p.proname from pg_proc p
 --       join pg_namespace n on n.oid=p.pronamespace
 --      where n.nspname='public' and p.prokind='f' order by 1"); do
---     grep -rqiE "function +(public\.)?$f *\(" supabase/*.sql || echo "SAKNAS I REPOT: $f"
+--     grep -rqiE "(create or replace|create) +function +(public\.)?$f *\(" supabase/*.sql || echo "SAKNAS I REPOT: $f"
 --   done
 --
 -- ⚠️ Funktioner är BARA en av fyra sorter. Kontrollera också:
@@ -273,6 +275,12 @@ grant  execute on function public.request_publish_change(bigint) to authenticate
 --               where t.typname='build_status' order by enumsortorder;
 --   kolumner:  select column_name from information_schema.columns
 --               where table_schema='public' and table_name='build_jobs';
---   triggers:  select tgname from pg_trigger where not tgisinternal;
+--   triggers:  select tgname, pg_get_triggerdef(oid) from pg_trigger where not tgisinternal;
+--   grants:    select proname, proacl from pg_proc p join pg_namespace n
+--               on n.oid=p.pronamespace where n.nspname='public';
+--   policies:  select tablename, policyname from pg_policies where schemaname='public';
+--
+-- Och matcha pa SIGNATUR, inte bara namn: repot har request_ai_draft(bigint, text),
+-- men en aldre overlagring kan ligga kvar i drift utan att synas i namnjamforelsen.
 --
 -- Version 1 tittade bara på funktioner och kallade sig ändå systematisk. Gör inte om det.
