@@ -15,13 +15,57 @@
 --   proowner('rls_auto_enable')  -> postgres  (create or replace fungerar)
 --   rolsuper(current_user)       -> FALSE     (create event trigger gar INTE)
 --
--- 🔴 LOOPFIXEN LIGGER INTE HÄR. Den hör hemma i `publish-site.yml`, inte i databasen.
--- Loopens motor är att workflowet SJÄLV PATCH:ar status='publishing' i sitt första steg.
--- Portalen har redan satt det värdet när knappen trycks — workflowets PATCH är redundant,
--- och det är den som föder nästa körning. Ett villkor i triggern kan inte skilja *portalen
--- som startar* från *workflowet som rapporterar in sig själv*: båda skriver samma värde.
--- Granskaren visade att v2:s villkor bara flyttade loopen till felvägen (`publish_failed`).
--- Fixen ligger i agent-repot som en egen PR.
+-- 🔴 LOOPFIXEN LIGGER INTE HÄR, och min förklaring av loopen var FEL i v3. Rättad:
+--
+-- Jag skrev att triggern "inte kan skilja portalen från workflowet, båda skriver samma
+-- värde". Det är osant, och granskaren fångade det. Funktionens FÖRSTA rad gör precis den
+-- skillnaden: workflowets redundanta PATCH ger `old = new = 'publishing'`, och
+-- `old.status is not distinct from 'publishing'` stoppar den. Samma körning kan inte fyra
+-- två gånger.
+--
+-- Den VERKLIGA loopen är en annan: körning A avslutar och sätter `published`. Körning B —
+-- redan köad — PATCH:ar `publishing`. Det ÄR en äkta övergång (`published → publishing`),
+-- triggern dispatchar C, och kedjan går runt.
+--
+-- Varför det ändå inte fixas här: villkoret måste då utesluta `published` som utgångsstatus,
+-- och v2 visade att varje sådan mängd läcker — `publish_failed` står med i portalens egen
+-- `canPublish`, och workflowets felväg sätter just `publish_failed`. Fixen hör hemma där
+-- den redundanta PATCH:en finns: i `publish-site.yml`, som egen PR.
+--
+-- ⚠️ RÖR INTE villkoret på rad ~180. Det är det som hindrar samma körning från att fyra
+-- två gånger. Den felaktiga historien ovan hade kunnat användas för att motivera bort det.
+--
+--
+-- ============================ KVITTO PA MATNINGEN ============================
+-- Granskaren underkande v1, v2 och v3 delvis for att "ordagrant ur drift" var ett
+-- pastaende utan bifogat belagg. Har ar belagget. Kor om det sjalv och jamfor.
+--
+--   select p.proname, md5(pg_get_functiondef(p.oid)) as md5,
+--          coalesce(array_to_string(p.proacl::text[],' '),'NULL (PUBLIC har EXECUTE)') as proacl
+--     from pg_proc p join pg_namespace n on n.oid=p.pronamespace
+--    where n.nspname='public' and p.proname in ('ai_usage_this_month','rls_auto_enable',
+--          'dispatch_publish_site','request_publish_change') order by 1;
+--
+-- Utfall 2026-08-23 (efter att migration 26 kordes 12:00 - se nedan):
+--   ai_usage_this_month     md5 ce9e0e33982bb9a8b1b3cc0f9c80df33
+--                           proacl: =X postgres=X anon=X authenticated=X service_role=X
+--   dispatch_publish_site   md5 77a3bc523635798ba379248cef459c32
+--                           proacl: =X postgres=X anon=X authenticated=X service_role=X
+--   request_publish_change  md5 19ba45353deef8a17c0af3b6e1ac9bca
+--                           proacl: postgres=X authenticated=X service_role=X   <- INGET =X
+--   rls_auto_enable         md5 6998ea6b4c2480f5d2e34b5dcf3f8d36
+--                           proacl: =X postgres=X anon=X authenticated=X service_role=X
+--
+-- ⚠️ TIDSORDNINGEN SPELAR ROLL, och granskaren hade ratt att fraga.
+-- Bada dispatch-funktionerna innehaller URL:en OakStride/oakstride-agent. Det vardet satte
+-- MIGRATION 26 i drift. Avlasningen ovan gjordes DAREFTER - matt i samma fraga:
+--   (pg_get_functiondef like '%OakStride/oakstride-agent%') -> true for bada.
+-- Filen aterger alltsa driften som den ser ut EFTER 26, inte fore. Den gor inte 26:s jobb.
+--
+-- ⚠️ VAD SOM INTE AR MATT: policies (pg_policies) och index. Filen gor darfor INGET
+-- fullstandighetsansprak pa dem. Rubriken galler funktioner, enum, kolumner, trigger och
+-- grants - inget mer. Granskarens fynd 6.
+-- ============================================================================
 --
 -- BAKGRUND
 -- 2026-08-23 upptäcktes att `dispatch_publish_site` fanns i drift men saknade migrationsfil.
@@ -78,6 +122,12 @@ begin
   return json_build_object('used', v_count, 'cap', v_cap);
 end $function$;
 
+-- ⚠️ INGEN revoke har, till skillnad fran request_publish_change nedan - och det ar matt,
+-- inte slarv. Driftens proacl innehaller `=X` (PUBLIC har EXECUTE). En revoke hade alltsa
+-- ANDRAT drift, vilket den har filen inte ska gora. Granskarens fynd 4 utgar darmed, men
+-- konsekvensen ska sta utskriven: i en ateruppbyggnad far anon EXECUTE pa en SECURITY
+-- DEFINER-funktion. Den grenar pa auth.uid() och ger anon {used:0, cap:15} - ofarligt, men
+-- det ar ett medvetet accepterat lage och inte en lucka.
 grant execute on function public.ai_usage_this_month() to authenticated;
 
 -- ---------------------------------------------------------------------------
@@ -125,38 +175,47 @@ begin
   select e.evtfoid, e.evtenabled, e.evtevent, e.evttags into r
     from pg_event_trigger e where e.evtname = 'ensure_rls';
 
+  -- ⚠️ VARNING, INTE EXCEPTION - och det ar ett medvetet byte fran v3.
+  -- kor-migrationer.yml kor filen med `psql -1`. Ett raise exception NAGONSTANS i filen
+  -- sanker da HELA filen, inklusive enum, kolumner, funktioner och triggerbindningen -
+  -- alltsa precis det den finns till for. I en ateruppbyggnad, dar ensure_rls inte finns,
+  -- hade v3 darfor blivit ett permanent stopp: migrationen kunde aldrig appliceras, och
+  -- tillstandet gick inte att laga inifran (rolsuper = false, matt).
+  -- Darfor larmar vakten hogljutt och later filen ga igenom. En hard assertion hor hemma i
+  -- en EGEN kontroll utanfor migrationskedjan, inte i en fil som maste appliceras.
   if not found then
-    -- ⛔ VI KAN INTE SKAPA DEN. `create event trigger` kraver SUPERUSER, och projektets
-    -- postgres-roll ar det inte. Uppmatt 2026-08-23: rolsuper = false.
-    -- Version 2 av filen forsokte skapa den anda. Den grenen hade havererat i precis det
-    -- scenario filen sager sig losa - en ateruppbyggnad - och tagit hela migrationen med
-    -- sig, eftersom kor-migrationer.yml kor med psql -1.
-    -- Darfor: larma hogljutt i stallet for att latsas losa det.
-    raise exception E'Migration 27: event-triggern ensure_rls SAKNAS, och den kan inte '
-      'skapas harifran - det kraver superuser.\n'
-      'Konsekvens: nya tabeller i public far INGEN RLS, och ar da lasbara for varje '
-      'inloggad kund.\n'
-      'Atgard: kor foljande i Supabases SQL-editor, som har hogre rattigheter:\n'
-      '  create event trigger ensure_rls on ddl_command_end\n'
-      '    when tag in (''CREATE TABLE'', ''CREATE TABLE AS'', ''SELECT INTO'')\n'
+    raise warning E'ensure_rls SAKNAS. Nya tabeller i public far INGEN RLS och ar da lasbara
+'
+      'for varje inloggad kund. Den kan inte skapas harifran - det kraver superuser.
+'
+      'Kor detta i Supabases SQL-editor:
+'
+      '  create event trigger ensure_rls on ddl_command_end
+'
+      '    when tag in (''CREATE TABLE'', ''CREATE TABLE AS'', ''SELECT INTO'')
+'
       '    execute function public.rls_auto_enable();';
+    return;
   end if;
 
   if r.evtfoid <> 'public.rls_auto_enable'::regproc then
-    raise exception 'Migration 27: event-triggern ensure_rls finns men pekar pa %, inte '
-      'public.rls_auto_enable. RLS-skyddet ar da inte det vi tror. Reds ut for hand.',
+    raise warning 'ensure_rls pekar pa %, inte public.rls_auto_enable. RLS-skyddet ar inte det vi tror.',
       r.evtfoid::regproc;
+  elsif r.evtenabled in ('D', 'R') then   -- D = disabled, R = replica (fyrar inte pa primaren)
+    raise warning 'ensure_rls ar AVSTANGD (%). Sla pa: alter event trigger ensure_rls enable;', r.evtenabled;
+  elsif r.evtevent <> 'ddl_command_end' then
+    -- v3 hamtade evtevent men ANVANDE det aldrig. En trigger pa fel event passerade da
+    -- alla kontroller och fyrade anda aldrig. Granskarens fynd 5.
+    raise warning 'ensure_rls ligger pa event %, inte ddl_command_end. Den fyrar aldrig pa CREATE TABLE.',
+      r.evtevent;
+  elsif r.evttags is not null and not ('CREATE TABLE' = any(r.evttags)) then
+    -- evttags NULL = ingen taggfiltrering = fyrar pa allt, vilket ar ratt. Utan det
+    -- explicita null-testet vilar det pa att NULL i en if-sats beter sig som falskt -
+    -- ratt utfall av fel skal, och nasta person "fixar" det med coalesce och far falsklarm.
+    raise warning 'ensure_rls taggar inte CREATE TABLE (taggar: %).', r.evttags;
+  else
+    raise notice 'ensure_rls: finns, pekar ratt, paslagen, ratt event, taggar CREATE TABLE.';
   end if;
-  if r.evtenabled in ('D', 'R') then  -- D = disabled, R = replica (fyrar inte pa primaren)
-    raise exception 'Migration 27: event-triggern ensure_rls finns men ar AVSTANGD. Nya '
-      'tabeller far da ingen RLS. Sla pa den med: alter event trigger ensure_rls enable;';
-  end if;
-  if not ('CREATE TABLE' = any(r.evttags)) then
-    raise exception 'Migration 27: event-triggern ensure_rls taggar inte CREATE TABLE. '
-      'Taggar: %. Skyddet galler da inte vanliga tabellskapanden.', r.evttags;
-  end if;
-
-  raise notice 'Event-triggern ensure_rls finns, pekar ratt, ar paslagen och taggar CREATE TABLE.';
 end
 $ens$;
 
@@ -205,6 +264,10 @@ end; $function$;
 -- Varje annan dispatch-funktion levereras med sin `create trigger` i samma fil; den här
 -- gjorde det inte, så en återuppbyggnad hade gett en funktion som aldrig anropades.
 -- Namnet är hämtat ur drift: build_jobs_publish_dispatch.
+-- ⚠️ `drop trigger` + `create trigger` tar ACCESS EXCLUSIVE-las pa build_jobs, och med
+-- `psql -1` halls laset till commit. Kors migrationen medan ett bygge eller en publicering
+-- ar i luften blockeras workflowets PATCH:ar, och PostgREST:s statement timeout kan gora
+-- det till ett byggfel utan uppenbar orsak. Kor nar inget jobb ar igang. Granskarens fynd 7.
 drop trigger if exists build_jobs_publish_dispatch on public.build_jobs;
 create trigger build_jobs_publish_dispatch
   after update on public.build_jobs
@@ -249,6 +312,9 @@ end $function$;
 -- 2026-08-23. Det ska bevaras, inte skrivas om. `create or replace` behåller befintliga
 -- grants, men i en återuppbyggnad skulle funktionen få Postgres standard (EXECUTE till
 -- PUBLIC). Därför skrivs det snäva läget ut explicit.
+-- Matt: driftens proacl saknar `=X` helt, alltsa har PUBLIC redan INGEN EXECUTE. Revoken
+-- nedan ar darfor en NO-OP mot dagens drift och far betydelse forst vid en ateruppbyggnad,
+-- dar Postgres standard annars ger PUBLIC EXECUTE.
 revoke execute on function public.request_publish_change(bigint) from public;
 revoke execute on function public.request_publish_change(bigint) from anon;
 grant  execute on function public.request_publish_change(bigint) to authenticated, service_role;
