@@ -2205,6 +2205,17 @@
   };
   // Felkoder fran request_publish_site (migration 28). RPC:n svarar med kod, inte text,
   // sa att samma svar gar att lasa bade av portalen och av ett skript.
+  // Normaliserar en doman EXAKT som request_publish_site gor i databasen (migration 28).
+  // Maste vara identisk: annars kan bekraftelsedialogen visa ett varde och RPC:n
+  // publicera ett annat - och dialogen ar den manskliga grinden for go-live.
+  // Returnerar "" om domanen ar ogiltig.
+  function normDomain(d) {
+    d = String(d == null ? "" : d).trim().toLowerCase()
+      .replace(/^https?:\/\//, "").replace(/^www\./, "")
+      .replace(/\/.*$/, "").replace(/\.$/, "");
+    return /^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/.test(d) ? d : "";
+  }
+
   var PUBLISH_FEL = {
     forbidden: "du saknar adminbehörighet",
     not_found: "byggjobbet finns inte",
@@ -2212,7 +2223,8 @@
     bad_status: "jobbet har fel status för publicering",
     bad_domain: "ogiltig domän",
     no_pat: "GitHub-nyckeln saknas i Vault",
-    dispatch_failed: "agenten kunde inte startas – jobbet är satt till misslyckat"
+    dispatch_failed: "agenten kunde inte startas – jobbet är satt till misslyckat",
+    not_publishing: "jobbet publiceras inte just nu – inget att återställa"
   };
 
   function slugify(s) {
@@ -2356,7 +2368,11 @@
         if (canPublish) actions += '<button class="btn btn-primary btn-inline" data-publish="' + j.id + '"' +
           (domain ? ' data-domain="' + esc(domain) + '"' : "") + ">" +
           (j.status === "publish_failed" ? "F&ouml;rs&ouml;k publicera igen" : "Publicera") + "</button>";
-        if (j.status === "publishing") actions += '<span class="muted">Publicerar… (GitHub Pages + DNS)</span>';
+        if (j.status === "publishing") actions += '<span class="muted">Publicerar… (GitHub Pages + DNS)</span> ' +
+          // Ett jobb kan fastna har utan att nagot publiceras: pg_net rapporterar inte
+          // HTTP-fel tillbaka till anroparen. Utan den har knappen ar jobbet last -
+          // publiceringsknappen ar borta och stadverktyget vagrar radera.
+          '<button class="btn btn-inline" data-reset="' + j.id + '" title="Använd om publiceringen har stått still i flera minuter">Fastnat? Återställ</button>';
         if (j.status === "preview_ready" && !j.customer_id) actions = '<span class="muted">Koppla en kund vid bygget för att kunna dela.</span>';
         var dnsNote = (j.status === "published" && j.dns_status && j.dns_status !== "ok" && j.dns_instructions)
           ? '<details style="margin-top:.6rem"><summary class="muted">DNS sätts manuellt hos HostUp (rör ej e-post)</summary>' +
@@ -2386,15 +2402,29 @@
           });
         });
       });
+      Array.prototype.forEach.call(box.querySelectorAll("[data-reset]"), function (btn) {
+        btn.addEventListener("click", function () {
+          if (!window.confirm("Återställ jobbet?\n\nAnvänd bara om publiceringen har stått still i flera minuter. Jobbet flyttas till \"Publicering misslyckades\" så att du kan försöka igen eller radera det.")) return;
+          btn.disabled = true; btn.textContent = "Återställer…";
+          sb.rpc("reset_publish_state", { p_job_id: btn.getAttribute("data-reset"), p_skal: null }).then(function (r) {
+            var fel = r.error ? r.error.message
+                              : (r.data && r.data.ok === false ? (PUBLISH_FEL[r.data.error] || r.data.error) : "");
+            if (fel) { toast("Kunde inte återställa: " + fel, true); btn.disabled = false; btn.textContent = "Fastnat? Återställ"; return; }
+            toast("Jobbet återställt – du kan försöka publicera igen.");
+            loadBuildJobs(boxId, customerId);
+          });
+        });
+      });
       Array.prototype.forEach.call(box.querySelectorAll("[data-publish]"), function (btn) {
         btn.addEventListener("click", function () {
           var id = btn.getAttribute("data-publish");
-          var domain = btn.getAttribute("data-domain") || "";
+          var domain = normDomain(btn.getAttribute("data-domain") || "");
           if (!domain) {
-            domain = (window.prompt("Kundens domän för go-live (utan https, t.ex. foretag.se):", "") || "").trim()
-              .replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
-            if (!domain) return;
-            if (!/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(domain)) { toast("Ogiltig domän.", true); return; }
+            // Tom ELLER ogiltig data-domain: fraga. Ett ogiltigt varde i briefen fick
+            // tidigare ga vidare helt ovaliderat - klienten kontrollerade bara i
+            // prompt-grenen.
+            domain = normDomain(window.prompt("Kundens domän för go-live (utan https, t.ex. foretag.se):", "") || "");
+            if (!domain) { toast("Ogiltig eller saknad domän.", true); return; }
           }
           if (!window.confirm("Publicera live på " + domain + "?\n\nSajten går live på kundens egna domän. DNS uppdateras (endast webb-poster läggs till – MX/e-post lämnas orört).")) return;
           btn.disabled = true; btn.textContent = "Publicerar…";
@@ -2405,7 +2435,15 @@
           sb.rpc("request_publish_site", { p_job_id: id, p_domain: domain }).then(function (r) {
             var fel = r.error ? r.error.message
                               : (r.data && r.data.ok === false ? (PUBLISH_FEL[r.data.error] || r.data.error) : "");
-            if (fel) { toast("Kunde inte starta publicering: " + fel, true); btn.disabled = false; btn.textContent = "Publicera"; return; }
+            if (fel) {
+              toast("Kunde inte starta publicering: " + fel, true);
+              btn.disabled = false;
+              btn.textContent = "Publicera";
+              // dispatch_failed har REDAN satt publish_failed i databasen. Utan en
+              // omladdning star chippet, felraden och knapptexten kvar pa gamla varden.
+              if (r.data && r.data.error === "dispatch_failed") loadBuildJobs(boxId, customerId);
+              return;
+            }
             toast("Publicering startad – " + ((r.data && r.data.domain) || domain) + " går live inom kort.");
             loadBuildJobs(boxId, customerId);
           });
