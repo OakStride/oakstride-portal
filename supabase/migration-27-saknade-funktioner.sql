@@ -12,7 +12,7 @@
 --   pg_get_triggerdef('build_jobs_publish_dispatch') -> AFTER UPDATE ON public.build_jobs
 --                                                       FOR EACH ROW EXECUTE FUNCTION
 --                                                       dispatch_publish_site()
---   proowner('rls_auto_enable')  -> postgres  (create or replace fungerar)
+--   proowner for ALLA FYRA funktionerna -> postgres  (create or replace fungerar pa samtliga)
 --   rolsuper(current_user)       -> FALSE     (create event trigger gar INTE)
 --
 -- 🔴 LOOPFIXEN LIGGER INTE HÄR, och min förklaring av loopen var FEL i v3. Rättad:
@@ -32,7 +32,8 @@
 -- `canPublish`, och workflowets felväg sätter just `publish_failed`. Fixen hör hemma där
 -- den redundanta PATCH:en finns: i `publish-site.yml`, som egen PR.
 --
--- ⚠️ RÖR INTE villkoret på rad ~180. Det är det som hindrar samma körning från att fyra
+-- ⚠️ RÖR INTE villkoret `old.status is not distinct from 'publishing'` i
+-- `dispatch_publish_site` (sektion 5). Det är det som hindrar samma körning från att fyra
 -- två gånger. Den felaktiga historien ovan hade kunnat användas för att motivera bort det.
 --
 --
@@ -40,21 +41,32 @@
 -- Granskaren underkande v1, v2 och v3 delvis for att "ordagrant ur drift" var ett
 -- pastaende utan bifogat belagg. Har ar belagget. Kor om det sjalv och jamfor.
 --
---   select p.proname, md5(pg_get_functiondef(p.oid)) as md5,
+--   select p.proname, p.proowner::regrole as owner,
+--          md5(pg_get_functiondef(p.oid)) as md5,
 --          coalesce(array_to_string(p.proacl::text[],' '),'NULL (PUBLIC har EXECUTE)') as proacl
 --     from pg_proc p join pg_namespace n on n.oid=p.pronamespace
 --    where n.nspname='public' and p.proname in ('ai_usage_this_month','rls_auto_enable',
 --          'dispatch_publish_site','request_publish_change') order by 1;
 --
 -- Utfall 2026-08-23 (efter att migration 26 kordes 12:00 - se nedan):
---   ai_usage_this_month     md5 ce9e0e33982bb9a8b1b3cc0f9c80df33
+--   ai_usage_this_month     md5 ce9e0e33982bb9a8b1b3cc0f9c80df33  owner postgres
 --                           proacl: =X postgres=X anon=X authenticated=X service_role=X
---   dispatch_publish_site   md5 77a3bc523635798ba379248cef459c32
+--   dispatch_publish_site   md5 77a3bc523635798ba379248cef459c32  owner postgres
 --                           proacl: =X postgres=X anon=X authenticated=X service_role=X
---   request_publish_change  md5 19ba45353deef8a17c0af3b6e1ac9bca
+--   request_publish_change  md5 19ba45353deef8a17c0af3b6e1ac9bca  owner postgres
 --                           proacl: postgres=X authenticated=X service_role=X   <- INGET =X
---   rls_auto_enable         md5 6998ea6b4c2480f5d2e34b5dcf3f8d36
+--   rls_auto_enable         md5 6998ea6b4c2480f5d2e34b5dcf3f8d36  owner postgres
 --                           proacl: =X postgres=X anon=X authenticated=X service_role=X
+--
+--   select tgname, tgenabled from pg_trigger
+--    where tgrelid='public.build_jobs'::regclass and not tgisinternal order by 1;
+--   Utfall 2026-08-23: samtliga FEM triggrar pa build_jobs har tgenabled = 'O'
+--   (O = paslagen, sessionens default). Ingen ar manuellt avstangd.
+--
+--   select evtname, evtenabled, evtevent, evttags
+--     from pg_event_trigger where evtname='ensure_rls';
+--   Utfall 2026-08-23: evtenabled 'O', evtevent 'ddl_command_end',
+--   evttags = {CREATE TABLE, CREATE TABLE AS, SELECT INTO}  (alla tre)
 --
 -- ⚠️ TIDSORDNINGEN SPELAR ROLL, och granskaren hade ratt att fraga.
 -- Bada dispatch-funktionerna innehaller URL:en OakStride/oakstride-agent. Det vardet satte
@@ -85,7 +97,8 @@
 -- skriver till, och tappat det automatiska RLS-skyddet på nya tabeller.
 --
 -- ⚠️ TRANSAKTION: `kor-migrationer.yml` kör filen med `psql -1`, alltså i EN transaktion.
--- `alter type ... add value` är tillåtet i en transaktion från PG12, men det nya värdet får
+-- Servern är uppmätt PG 17.6 (2026-08-23). `alter type ... add value` är därmed
+-- tillåtet i en transaktion (gäller från PG12), men det nya värdet får
 -- inte *användas* i samma transaktion. Här används det inte — funktionerna nedan jämför mot
 -- literalen först vid körning, inte vid definition. Mot dagens prod är enum-blocket ändå en
 -- no-op, eftersom värdena redan finns.
@@ -168,7 +181,11 @@ $function$;
 -- Event-triggern. Version 1 kontrollerade BARA att namnet fanns — granskarens fynd 5.
 -- Ett skydd vars enda kontroll är att ett namn förekommer i en katalog är dokumenterat,
 -- inte verifierat. Nu kontrolleras att den pekar på rätt funktion, är påslagen, och har
--- rätt taggar. Avviker något HAVERERAR migrationen hellre än att rapportera framgång.
+-- rätt taggar. Avviker något LARMAR vakten med `raise warning` och låter filen gå
+-- igenom - skälet står i vaktens egen kommentar nedan. Den HAVERERAR alltså INTE
+-- (ändrat från v3).
+-- Mot drift 2026-08-23 tar vakten ELSE-grenen: alla fyra kontrollerna passerar. Varje
+-- warning i loggen ar darfor en FORANDRING sedan dess, inte ett kant lage.
 do $ens$
 declare r record;
 begin
@@ -224,9 +241,20 @@ $ens$;
 -- ---------------------------------------------------------------------------
 -- Ordagrant ur drift (pg_get_functiondef 2026-08-23). OFORANDRAD.
 --
--- 🔴 Den observerade publiceringsloopen fixas INTE har. Se filhuvudet: motorn ar
--- workflowets egen PATCH till 'publishing', och den ligger i agent-repot. Ett villkor
--- har kan inte skilja portalen fran workflowet - bada skriver samma varde.
+-- ⚠️ TIDSBEGRANSAD. Fredrik beslutade 2026-08-24 att publiceringen gar via en RPC
+-- fran portalen och att triggern `build_jobs_publish_dispatch` TAS BORT i migration
+-- 28. Den har sektionen dokumenterar driften som den sag ut 2026-08-23; den beskriver
+-- INTE hur publicering fungerar efter att 28 kort. Loopen upphor med triggern.
+--
+-- 🔴 Den observerade publiceringsloopen fixas INTE har.
+-- Funktionens forsta rad skiljer redan avsandarna at: workflowets redundanta PATCH
+-- ger `old = new = 'publishing'` och stoppas av det andra ledet i villkoret nedan.
+-- Samma korning kan alltsa inte fyra tva ganger. Den verkliga loopen ar NASTA
+-- kornings `published -> publishing`, vilket ar en akta overgang. Den fixas inte i
+-- DB-lagret.
+-- ⚠️ TA INTE BORT villkoret nedan. Motiveringen "villkoret kan anda inte skilja
+-- portalen fran workflowet, bada skriver samma varde" stod har till 2026-08-23
+-- och ar MATT FALSK.
 CREATE OR REPLACE FUNCTION public.dispatch_publish_site()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -264,6 +292,12 @@ end; $function$;
 -- Varje annan dispatch-funktion levereras med sin `create trigger` i samma fil; den här
 -- gjorde det inte, så en återuppbyggnad hade gett en funktion som aldrig anropades.
 -- Namnet är hämtat ur drift: build_jobs_publish_dispatch.
+-- ⚠️ `pg_get_triggerdef` visar INTE `tgenabled`. Ett drop+create satter alltid
+-- tillbaka 'O'. Matt 2026-08-23: alla fem triggrar pa build_jobs star pa 'O', sa
+-- aterskapandet ar en no-op. MEN: har nagon slagit AV triggern som akutatgard mot
+-- publiceringsloopen efter den matningen, sla PA den igen ar precis vad den har
+-- filen gor. Kontrollera tgenabled omedelbart fore korning, inte bara vid
+-- granskningen.
 -- ⚠️ `drop trigger` + `create trigger` tar ACCESS EXCLUSIVE-las pa build_jobs, och med
 -- `psql -1` halls laset till commit. Kors migrationen medan ett bygge eller en publicering
 -- ar i luften blockeras workflowets PATCH:ar, och PostgREST:s statement timeout kan gora
@@ -341,7 +375,8 @@ grant  execute on function public.request_publish_change(bigint) to authenticate
 --               where t.typname='build_status' order by enumsortorder;
 --   kolumner:  select column_name from information_schema.columns
 --               where table_schema='public' and table_name='build_jobs';
---   triggers:  select tgname, pg_get_triggerdef(oid) from pg_trigger where not tgisinternal;
+--   triggers:  select tgname, tgenabled, pg_get_triggerdef(oid) from pg_trigger
+--               where not tgisinternal;
 --   grants:    select proname, proacl from pg_proc p join pg_namespace n
 --               on n.oid=p.pronamespace where n.nspname='public';
 --   policies:  select tablename, policyname from pg_policies where schemaname='public';
@@ -350,3 +385,12 @@ grant  execute on function public.request_publish_change(bigint) to authenticate
 -- men en aldre overlagring kan ligga kvar i drift utan att synas i namnjamforelsen.
 --
 -- Version 1 tittade bara på funktioner och kallade sig ändå systematisk. Gör inte om det.
+--
+-- ⚠️ KVITTOT I FILHUVUDET BEVISAR ATT DRIFTEN INTE ÄNDRATS — INTE ATT FILEN
+--   ÅTERGER DEN. Kvittot sparar md5, inte definitionstexten. Avviker en av filens
+--   fyra kroppar fran drift skriver `create or replace` over drift TYST, och
+--   originalet gar inte att aterstalla ur ett md5.
+--   Efterkontroll som faktiskt bevisar att FILEN aterger driften: kor
+--   frisksedelsfragan i huvudet EN gang till EFTER att migrationen kort. Samma
+--   fyra md5 = filens kroppar ar identiska med drift och ingenting skrevs over.
+--   Avvikande md5 = filen andrade drift.
