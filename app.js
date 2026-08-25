@@ -2420,7 +2420,6 @@
         // oppna Action-loggen. Nu star receptet i portalen. Att fa ut det till kunden ar
         // en egen fraga - kundvyn maste da hamta faltet - och den ar inte tagen.
         var visaDns = j.status === "published" || j.status === "publish_failed";
-        var visaDns = j.status === "published" || j.status === "publish_failed";
         var dnsNote = (visaDns && j.dns_status && j.dns_status !== "ok" && j.dns_instructions)
           ? '<details style="margin-top:.6rem"><summary class="muted">DNS sätts manuellt hos HostUp (rör ej e-post)</summary>' +
             '<pre style="white-space:pre-wrap;font-size:.82rem;margin:.4rem 0 0">' + esc(j.dns_instructions) + "</pre></details>"
