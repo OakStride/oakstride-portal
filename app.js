@@ -2208,6 +2208,12 @@
   // portalen en knapp som databasen avvisar. Tio minuter: en frisk publicering har
   // aldrig tagit sa lang tid, och Pages-certifikatet ar det langsammaste steget.
   var RESET_EFTER_MIN = 10;
+  // Aldern raknas ut VID RENDERING. Utan omritning ser en admin som oppnade sidan vid
+  // tva minuter "Publicerar... - i 2 min" for alltid, utan knapp - och texten ser ut
+  // som levande information. Jobbet ar da oatkomligt: publiceringsknappen ar borta,
+  // reset-knappen renderades aldrig, stadverktyget vagrar radera. Enda utvagen vore F5,
+  // och ingenting i granssnittet antyder det.
+  var buildPollTimer = null;
 
   // Felkoder fran request_publish_site (migration 28). RPC:n svarar med kod, inte text,
   // sa att samma svar gar att lasa bade av portalen och av ett skript.
@@ -2382,18 +2388,22 @@
         if (j.status === "publishing") {
           // Adminen kan inte skilja LANGSAM fran FASTNAD - en frisk publicering tar
           // minuter (git clone, Pages-certifikat, HostUp-zon, DNS). Darfor tva saker:
-          // aldern skrivs ut, och Aterstall-knappen finns inte forran jobbet stott
-          // still lange nog att det inte kan vara normal drift. Utan grinden ar
+          // minuter (git clone, kundrepo, Pages-API, HostUp-zon, DNS - workflowet
+          // VANTAR daremot inte pa certifikatet). Darfor tva saker: aldern skrivs ut, och knappen finns inte forran jobbet stott
           // knappen en ny vag till dubbel publicering: aterstall -> publish_failed ->
           // knappen 'Forsok publicera igen' -> en andra korning mot samma kundrepo
           // medan den forsta skriver CNAME och DNS. Databasen har samma grind.
-          var startad = j.updated_at ? new Date(j.updated_at).getTime() : 0;
-          var minuter = startad ? Math.floor((Date.now() - startad) / 60000) : null;
+          // ⚠️ Failar AT RATT HALL. Saknas updated_at, ar den oparsbar (NaN) eller ligger
+          // i framtiden, visas knappen anda och reset_publish_state far avgora med
+          // too_soon. Klientgrinden ar en bekvamlighet; databasens ar grinden. Att goma
+          // raddningen nar underlaget saknas vore att lasa jobbet av forsiktighet.
+          var startad = j.updated_at ? new Date(j.updated_at).getTime() : NaN;
+          var minuter = isNaN(startad) ? null : Math.floor((Date.now() - startad) / 60000);
           actions += '<span class="muted">Publicerar… (GitHub Pages + DNS)' +
-            (minuter === null ? "" : " – i " + minuter + " min") + "</span> ";
-          if (minuter !== null && minuter >= RESET_EFTER_MIN) {
+            (minuter === null || minuter < 0 ? "" : " – i " + minuter + " min") + "</span> ";
+          if (minuter === null || minuter >= RESET_EFTER_MIN) {
             actions += '<button class="btn btn-ghost btn-inline" data-reset="' + j.id +
-              '" title="Publiceringen har stått still i ' + minuter + ' minuter">Fastnat? Återställ</button>';
+              '" title="' + (minuter === null ? "Okänt hur länge publiceringen har pågått" : "Publiceringen har stått still i " + minuter + " minuter") + '">Fastnat? Återställ</button>';
           }
         }
         if (j.status === "preview_ready" && !j.customer_id) actions = '<span class="muted">Koppla en kund vid bygget för att kunna dela.</span>';
@@ -2415,6 +2425,13 @@
           dnsNote +
           "</div>";
       }).join("");
+      // Rita om sa lange nagot jobb publiceras, sa att aldern och Aterstall-knappen
+      // foljer klockan. Timern rensas alltid forst - annars ackumuleras en ny per
+      // omladdning och listan borjar rita om sig sjalv i allt tatare takt.
+      if (buildPollTimer) { clearTimeout(buildPollTimer); buildPollTimer = null; }
+      if (rows.some(function (j) { return j.status === "publishing"; })) {
+        buildPollTimer = setTimeout(function () { loadBuildJobs(boxId, customerId); }, 60000);
+      }
       Array.prototype.forEach.call(box.querySelectorAll("[data-share]"), function (btn) {
         btn.addEventListener("click", function () {
           btn.disabled = true; btn.textContent = "Delar…";
@@ -2427,12 +2444,18 @@
       });
       Array.prototype.forEach.call(box.querySelectorAll("[data-reset]"), function (btn) {
         btn.addEventListener("click", function () {
-          if (!window.confirm("Återställ jobbet?\n\nAnvänd bara om publiceringen har stått still i flera minuter. Jobbet flyttas till \"Publicering misslyckades\" så att du kan försöka igen eller radera det.")) return;
+          if (!window.confirm("Återställ jobbet?\n\nKnappen visas först när publiceringen stått still i 10 minuter. Jobbet flyttas till \"Publicering misslyckades\" så att du kan försöka igen eller radera det.")) return;
           btn.disabled = true; btn.textContent = "Återställer…";
           sb.rpc("reset_publish_state", { p_job_id: btn.getAttribute("data-reset") }).then(function (r) {
             var fel = r.error ? r.error.message
                               : (r.data && r.data.ok === false ? (PUBLISH_FEL[r.data.error] || r.data.error) : "");
             if (fel) {
+              // too_soon bar bade alder och krav. Den admin som drabbats av en frusen vy
+              // eller en skev klocka ar just den som behover siffran, inte ordet "vänta".
+              if (r.data && r.data.error === "too_soon" && r.data.kravs_sekunder) {
+                var kvar = Math.ceil((r.data.kravs_sekunder - (r.data.alder_sekunder || 0)) / 60);
+                fel += " (försök igen om " + (kvar > 0 ? kvar : 1) + " min)";
+              }
               toast("Kunde inte återställa: " + fel, true);
               btn.disabled = false;
               btn.textContent = "Fastnat? Återställ";
