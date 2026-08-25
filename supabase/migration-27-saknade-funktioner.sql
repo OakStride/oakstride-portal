@@ -302,10 +302,30 @@ end; $function$;
 -- `psql -1` halls laset till commit. Kors migrationen medan ett bygge eller en publicering
 -- ar i luften blockeras workflowets PATCH:ar, och PostgREST:s statement timeout kan gora
 -- det till ett byggfel utan uppenbar orsak. Kor nar inget jobb ar igang. Granskarens fynd 7.
-drop trigger if exists build_jobs_publish_dispatch on public.build_jobs;
-create trigger build_jobs_publish_dispatch
-  after update on public.build_jobs
-  for each row execute function public.dispatch_publish_site();
+-- 🔴 VAKT (tillagd 2026-08-25). Ateskapa INTE triggern om migration 28 redan kort.
+--
+-- Migration 28 slapper den har triggern med flit (Fredriks beslut 2026-08-24). Kors 28
+-- forst och 27 darefter - fullt mojligt, eftersom kor-migrationer.yml bara garanterar
+-- nummerordning INOM en korning och de tva ligger i olika PR:er - da vore motorn
+-- tillbaka i drift OVANPA den nya RPC-vagen. Varje publicering hade gett tva
+-- dispatchar, och loopen fran 2026-08-23 vore ateruppvackt.
+--
+-- Vakten kanner igen 28 pa att `request_publish_site` finns. Den ar skyddsnatet, inte
+-- planen: ratt ordning ar 27 fore 28. Funktionen ovan aterskapas daremot alltid - utan
+-- trigger ar den inert, och filens uppgift ar att dokumentera vad som fanns i drift.
+do $vakt$
+begin
+  if exists (select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+              where n.nspname = 'public' and p.proname = 'request_publish_site') then
+    raise warning 'Migration 28 ar redan kord (request_publish_site finns). Triggern build_jobs_publish_dispatch ateskapas INTE - den ar avsiktligt borttagen. Detta ar ratt beteende, inte ett fel.';
+  else
+    drop trigger if exists build_jobs_publish_dispatch on public.build_jobs;
+    create trigger build_jobs_publish_dispatch
+      after update on public.build_jobs
+      for each row execute function public.dispatch_publish_site();
+  end if;
+end
+$vakt$;
 
 -- ---------------------------------------------------------------------------
 -- 6. request_publish_change — kundens "publicera min ändring"
