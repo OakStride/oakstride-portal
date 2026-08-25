@@ -130,6 +130,11 @@ begin
   -- eller raderas (städverktyget vägrar) — enda utvägen vore handskriven SQL mot produktion.
   --   Läget 2026-08-25: net._http_response innehåller 20 st 204 och 3 st 200. Noll fel
   --   hittills — men frånvaro av fel i historiken är inte ett skydd.
+--   ⚠️ pg_net ar inte enda vagen till ett fastnat 'publishing'. En AVBRUTEN
+--   Actions-korning ar en annan: publish-site.yml:s felsteg har `if: failure()`, och
+--   failure() ar FALSKT nar en korning avbryts. Da satts varken published eller
+--   publish_failed. Uppmatt 2026-08-25: 'cancelled' finns bland de 19 korningarnas
+--   utfall, sa vagen ar inte teoretisk.
   begin
     perform net.http_post(
       url  := 'https://api.github.com/repos/OakStride/oakstride-agent/dispatches',
@@ -205,10 +210,33 @@ grant  execute on function public.request_publish_site(uuid, text) to authentica
 -- grind (RESET_EFTER_MIN i app.js) - de tva MASTE folja at, annars visar portalen en
 -- knapp som databasen avvisar.
 --
+-- KVITTO PA TALET (uppmatt 2026-08-25, 19 korningar av publish-site.yml):
+--   kolatens  min 0 s   median 0 s   max 0 s
+--   kortid    min 13 s  median 17 s  max 23 s
+--   totalt    min 13 s  median 17 s  max 23 s   -> tio minuter ar 26x det langsta
+--   som nagonsin mattes. Marginalen ar tilltagen med flit: kostnaden for den ar att
+--   en admin vantar tio minuter pa ett verkligt fastnat jobb, vilket ar billigt mot
+--   en dubbelpublicering. Workflowet har inga vantloopar och vantar INTE pa
+--   Pages-certifikatet (`|| echo` pa https_enforced).
+--
+-- ⚠️ VAD GRINDEN INTE VET. Den mater `now() - updated_at` - tid sedan raden rordes -
+-- inte om en korning faktiskt ar i luften. Den auktoritativa signalen (finns en
+-- publish-site-korning for det har job_id, och lever den?) ligger hos GitHub och
+-- konsulteras inte. Kolatensen ar 0 s i alla 19 matta korningar, men vid runner-brist
+-- eller en GitHub-incident kan ett jobb sta koat langre an tio minuter - och da
+-- oppnas grinden medan korningen fortfarande ar pa vag. Las alltsa grinden som ett
+-- rimligt skydd, inte som en garanti.
+--
 -- Skalet skrivs INTE till `error`. Kolumnen ar kundlasbar (samma resonemang som i
 -- request_publish_site ovan), och en admin som skriver "kunden svarar inte, PAT:en
 -- verkar utgangen" som skal hade publicerat det till kunden. Funktionen tar darfor
 -- ingen fritext alls - texten ar fast och kundvand.
+-- Gratis forsakring: filen har skrivits om tva ganger och bar i v2 signaturen
+-- (uuid, text). `create or replace` kan inte ersatta en ANNAN signatur - den hade blivit
+-- en overlagring, och den gamla varianten saknade aldersgrind och tog fritext till den
+-- kundlasbara error-kolumnen. Uppmatt 2026-08-25: ingen av funktionerna finns i drift,
+-- sa droppen ar en no-op i dag. Den star har for det fall nagon kort v2 for hand.
+drop function if exists public.reset_publish_state(uuid, text);
 create or replace function public.reset_publish_state(p_job_id uuid)
  returns json
  language plpgsql
@@ -247,8 +275,10 @@ begin
   end if;
 
   update build_jobs
+  -- Texten havdar INGEN orsak. Efter tio minuter vet vi inte att publiceringen aldrig
+  -- startade - den kan ha startat och dott halvvags. Och kolumnen ar kundlasbar.
      set status = 'publish_failed',
-         error  = 'Publiceringen återställdes manuellt – den hade fastnat utan att starta.'
+         error  = 'Publiceringen återställdes manuellt efter att ha stått still.'
    where id = p_job_id;
 
   return json_build_object('ok', true, 'alder_sekunder', floor(extract(epoch from v_alder))::bigint);
