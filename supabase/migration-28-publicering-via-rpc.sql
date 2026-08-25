@@ -16,27 +16,31 @@
 --
 -- Den dubbla rollen är hela felet. Loopen 2026-08-23 12:56 (sex körningar på nittio
 -- sekunder) gick: körning A sätter `published` -> körning B, redan köad, PATCH:ar
--- `publishing` -> äkta övergång -> triggern dispatchar C -> och runt igen. Att villkora
--- triggern hårdare flyttar bara loopen till `publish_failed`-vägen; att ta bort workflowets
--- PATCH stänger loopen men avväpnar alla tre läsarna på den manuella vägen — och den vägen
--- är den enda som skriver DNS (`repository_dispatch` har inga `inputs`, så portalknappen ger
--- alltid APPLY_DNS=false).
+-- `publishing` -> äkta övergång -> triggern dispatchar C -> och runt igen.
 --
 -- Efter den här migrationen är `status` REN PRESENTATION. Ingenting mekaniskt hänger på den,
 -- de tre läsarna fungerar precis som förut, och det som startar en publicering är ett
 -- uttryckligt anrop — inte en sidoeffekt av ett tabellskriv.
 --
--- Förebilden är `request_publish_change` (kundens "publicera min ändring", migration 27),
--- som redan gör exakt detta för det andra publiceringsflödet.
+-- ============================ ORDNING — LÄS DETTA ============================
 --
--- ============================ ORDNING ============================
--- ⚠️ Migration 27 skriver ned `dispatch_publish_site` + triggern ur drift och ska mergas
--- FÖRE den här. Annars beskriver `main` en trigger som varken skapas eller släpps.
--- `drop ... if exists` gör filen ofarlig att köra oavsett ordning, men repohistoriken
--- blir bara sann i rätt ordning.
+-- 🔴 MIGRATION 27 MÅSTE KÖRAS FÖRE DEN HÄR. Skälet är INTE att repohistoriken blir prydlig.
+--
+-- Migration 27 gör ovillkorligt `create or replace function dispatch_publish_site()` +
+-- `create trigger build_jobs_publish_dispatch`. Körs 28 först och 27 därefter — vilket är
+-- fullt möjligt, eftersom `kor-migrationer.yml` bara garanterar nummerordning INOM en
+-- körning och 27 ligger i en egen omergad PR — då är motorn TILLBAKA i drift samtidigt som
+-- portalen anropar RPC:n. Varje publicering ger då två dispatchar, och loopen är återuppväckt.
+--
+-- Migration 27 har därför fått en vakt som vägrar återskapa triggern om den här filen redan
+-- körts (den kontrollerar om `request_publish_site` finns). Vakten är skyddsnätet, inte
+-- planen: kör 27 först ändå.
+--
+-- Beroendet åt andra hållet är också hårt: enumvärdena 'publishing' och 'publish_failed'
+-- skapas i repot BARA av migration 27. Utan den kraschar RPC:n nedan på första anropet.
 --
 -- ⚠️ `drop trigger` tar ACCESS EXCLUSIVE-lås på build_jobs. Kör när inget bygge och ingen
--- publicering är i luften (samma varning som migration 27).
+-- publicering är i luften. Uppmätt 2026-08-25: `build_jobs` är tom, noll rader.
 
 -- ---------------------------------------------------------------------------
 -- 1. Ny RPC — admin startar go-live
@@ -50,7 +54,6 @@ as $function$
 declare
   v_is_admin boolean;
   v_status   public.build_status;
-  v_brief    jsonb;
   v_customer uuid;
   v_shared   timestamptz;
   v_domain   text;
@@ -65,19 +68,31 @@ begin
 
   -- Domänen normaliseras och valideras HÄR, inte bara i webbläsaren. Portalens egen
   -- kontroll finns kvar för snabb återkoppling, men den är kosmetisk: en RPC som litar på
-  -- klienten skyddar ingenting. Mönstren skrivs med [.] i stället för bakstreck-punkt,
-  -- så att filen överlever varje väg den kan tänkas passera.
+  -- klienten skyddar ingenting. Har jobbet redan `brief.domain` satt skickar portalen
+  -- dessutom vidare det värdet HELT OVALIDERAT — då är den här grinden den enda som finns.
+  --
+  -- Mönstret är medvetet IDENTISKT med publish-site.yml:148, inte lösare. Ett lösare
+  -- mönster här släpper igenom `kund.123`, `kund.x` och `192.168.1.10` (uppmätt 2026-08-25),
+  -- och de tar sig då förbi CNAME-skrivningen i kundens repo innan workflowet avbryter —
+  -- kundens Pages-sajt står kvar med fel custom domain tills någon rättar den för hand.
+  -- Skrivet med [.] i stället för bakstreck-punkt, så filen överlever varje väg den passerar.
   v_domain := lower(btrim(coalesce(p_domain, '')));
   v_domain := regexp_replace(v_domain, '^https?://', '');
   v_domain := regexp_replace(v_domain, '^www[.]', '');
   v_domain := regexp_replace(v_domain, '/.*$', '');
-  if v_domain !~ '^[a-z0-9]([a-z0-9-]*[a-z0-9])?([.][a-z0-9]([a-z0-9-]*[a-z0-9])?)+$' then
+  v_domain := regexp_replace(v_domain, '[.]$', '');      -- avslutande punkt: giltig, normaliseras bort
+  if v_domain !~ '^([a-z0-9]([a-z0-9-]*[a-z0-9])?[.])+[a-z]{2,}$' then
     return json_build_object('ok', false, 'error', 'bad_domain');
   end if;
 
-  select status, brief, customer_id, shared_at
-    into v_status, v_brief, v_customer, v_shared
-    from build_jobs where id = p_job_id;
+  -- `for update` låser raden. Utan den kan två samtidiga anrop (två flikar, en dubbelklick
+  -- som slinker förbi knappens disabled) båda läsa 'approved', båda passera grinden och
+  -- båda dispatcha — två fullständiga publiceringar, inklusive två DNS-skrivningar.
+  -- Att flytta grinden till databasen är meningslöst om den inte är atomisk.
+  select status, customer_id, shared_at
+    into v_status, v_customer, v_shared
+    from build_jobs where id = p_job_id
+     for update;
   if not found then
     return json_build_object('ok', false, 'error', 'not_found');
   end if;
@@ -102,9 +117,19 @@ begin
          error  = null
    where id = p_job_id;
 
-  -- Felet sväljs INTE tyst här, till skillnad från de gamla dispatch-funktionerna.
-  -- En tyst `exception when others then null` gav ett jobb som stod kvar på 'publishing'
-  -- utan att någonsin ha startats, och ingen visste varför.
+  -- ⚠️ VAD DET HÄR BLOCKET FÅNGAR — OCH VAD DET INTE FÅNGAR.
+  -- `net.http_post` i pg_net är ASYNKRON: anropet lägger en rad i net.http_request_queue,
+  -- returnerar ett id och committar. Själva HTTP-anropet görs av en bakgrundsarbetare efter
+  -- att transaktionen är klar.
+  --   FÅNGAS:      att pg_net saknas, fel argumenttyper, rättighetsfel på schemat net.
+  --   FÅNGAS INTE: HTTP 401 (PAT utgången eller fel format), 404 (fel ägare/repo),
+  --                403 (rate limit, saknad scope), timeout, eller att arbetaren står still.
+  -- I de fallen svarar RPC:n {"ok":true} medan ingenting startade, och svaret hamnar i
+  -- net._http_response där ingen läser det. Det är därför `reset_publish_state` nedan finns:
+  -- utan den kan ett jobb som fastnat på 'publishing' varken publiceras om (knappen är borta)
+  -- eller raderas (städverktyget vägrar) — enda utvägen vore handskriven SQL mot produktion.
+  --   Läget 2026-08-25: net._http_response innehåller 20 st 204 och 3 st 200. Noll fel
+  --   hittills — men frånvaro av fel i historiken är inte ett skydd.
   begin
     perform net.http_post(
       url  := 'https://api.github.com/repos/OakStride/oakstride-agent/dispatches',
@@ -120,9 +145,13 @@ begin
       )
     );
   exception when others then
+    -- Felkolumnen är KUNDLÄSBAR: migration 17 ger kunden select på hela raden när
+    -- customer_id matchar och shared_at är satt — och RPC:n kräver just det. Rå Postgres-
+    -- feltext (schemanamn, signaturer) hör inte hemma där. Detaljen går i svaret i stället,
+    -- som bara den anropande adminen ser.
     update build_jobs
        set status = 'publish_failed',
-           error  = 'dispatch misslyckades: ' || sqlerrm
+           error  = 'Publiceringen kunde inte startas. Försök igen, eller kontakta OakStride.'
      where id = p_job_id;
     return json_build_object('ok', false, 'error', 'dispatch_failed', 'detail', sqlerrm);
   end;
@@ -132,15 +161,71 @@ end $function$;
 
 -- Samma snäva behörighet som request_publish_change: varken PUBLIC eller anon.
 -- Kontrollen inuti funktionen är admin-grinden; grant:en är bara ytterdörren.
+-- OBS: `service_role` har ingen JWT-sub, så auth.uid() är null och anropet ger alltid
+-- 'forbidden'. Grant:en är alltså inert — den står med för att spegla request_publish_change,
+-- och den som senare vill låta agenten anropa RPC:n med servicenyckeln ska veta varför det
+-- inte fungerar.
 revoke execute on function public.request_publish_site(uuid, text) from public;
 revoke execute on function public.request_publish_site(uuid, text) from anon;
 grant  execute on function public.request_publish_site(uuid, text) to authenticated, service_role;
 
 -- ---------------------------------------------------------------------------
--- 2. Motorn kopplas bort — triggern och dess funktion släpps
+-- 2. Vägen ut ur ett fastnat 'publishing'
+-- ---------------------------------------------------------------------------
+-- Ett jobb kan fastna på 'publishing' utan att någon publicering pågår — se det långa
+-- blocket ovan om vad pg_net inte rapporterar. I det läget är jobbet oåtkomligt för
+-- ALLA verktyg som finns: knappen är borta (app.js canPublish saknar 'publishing'),
+-- kortet visar "Publicerar…" för alltid, och stada-testdata.yml vägrar radera.
+-- Den här funktionen är utvägen, och den är avsiktligt trubbig: den flyttar jobbet till
+-- publish_failed, vilket är ett läge portalen redan kan hantera (knappen kommer tillbaka
+-- som "Försök publicera igen") och städverktyget redan får radera.
+create or replace function public.reset_publish_state(p_job_id uuid, p_skal text default null)
+ returns json
+ language plpgsql
+ security definer
+ set search_path to 'public'
+as $function$
+declare
+  v_is_admin boolean;
+  v_status   public.build_status;
+begin
+  select coalesce(is_admin, false) into v_is_admin from profiles where id = auth.uid();
+  if not coalesce(v_is_admin, false) then
+    return json_build_object('ok', false, 'error', 'forbidden');
+  end if;
+
+  select status into v_status from build_jobs where id = p_job_id for update;
+  if not found then
+    return json_build_object('ok', false, 'error', 'not_found');
+  end if;
+  -- Bara ett fastnat jobb får återställas. Att kunna slå om vilken status som helst vore
+  -- ett nytt sätt att gå runt statusflödet.
+  if v_status::text <> 'publishing' then
+    return json_build_object('ok', false, 'error', 'not_publishing', 'status', v_status::text);
+  end if;
+
+  update build_jobs
+     set status = 'publish_failed',
+         error  = coalesce(nullif(btrim(p_skal), ''),
+                           'Publiceringen återställdes manuellt – den hade fastnat utan att starta.')
+   where id = p_job_id;
+
+  return json_build_object('ok', true);
+end $function$;
+
+revoke execute on function public.reset_publish_state(uuid, text) from public;
+revoke execute on function public.reset_publish_state(uuid, text) from anon;
+grant  execute on function public.reset_publish_state(uuid, text) to authenticated, service_role;
+
+-- ---------------------------------------------------------------------------
+-- 3. Motorn kopplas bort — triggern och dess funktion släpps
 -- ---------------------------------------------------------------------------
 -- Efter det här är `status` ren presentation. Att workflowet, portalen eller en människa
 -- skriver 'publishing' startar ingenting.
+-- Ordningen spelar roll: `drop function` utan `cascade` avbryter med beroendefel så länge
+-- triggern finns kvar, och med `psql -1` faller då hela filen.
+-- Uppmätt 2026-08-25: triggern är ENDA referensen till dispatch_publish_site — ingen annan
+-- funktion, vy eller constraint nämner den.
 drop trigger if exists build_jobs_publish_dispatch on public.build_jobs;
 drop function if exists public.dispatch_publish_site();
 
@@ -156,18 +241,33 @@ drop function if exists public.dispatch_publish_site();
 --     where n.nspname = 'public' and p.proname = 'dispatch_publish_site';
 --
 -- 3) Övriga triggrar på build_jobs ska vara KVAR och påslagna. Uppmätt före migrationen
---    2026-08-23: fem triggrar, alla med tgenabled = 'O'. Efteråt ska fyra vara kvar,
+--    2026-08-25: fem triggrar, alla med tgenabled = 'O'. Efteråt ska fyra vara kvar,
 --    fortfarande alla 'O':
 --    select tgname, tgenabled from pg_trigger
 --     where tgrelid = 'public.build_jobs'::regclass and not tgisinternal order by 1;
 --
--- 4) RPC:n ska finnas, ägas av postgres, och sakna =X (ingen EXECUTE till PUBLIC):
---    select p.proname, pg_get_userbyid(p.proowner) as owner,
+-- 4) Båda funktionerna ska finnas i ETT exemplar, vara SECURITY DEFINER med satt
+--    search_path, och sakna =X (ingen EXECUTE till PUBLIC). Signaturen kontrolleras för att
+--    en avvikande signatur skulle ge en ÖVERLAGRING i stället för en ersättning, och
+--    PostgREST kan då träffa fel variant:
+--    select p.oid::regprocedure::text as signatur, p.prosecdef, p.proconfig,
+--           pg_get_userbyid(p.proowner) as owner,
 --           coalesce(array_to_string(p.proacl::text[], ' '), 'NULL (PUBLIC har EXECUTE)') as proacl
 --      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
---     where n.nspname = 'public' and p.proname = 'request_publish_site';
+--     where n.nspname = 'public'
+--       and p.proname in ('request_publish_site', 'reset_publish_state');
+--    Uppmätt 2026-08-25, före körning: ingen av dem finns. Ingen överlagringsrisk.
 --
--- 5) Rökprov utan att publicera något: anropet ska svara {"ok":false,"error":"not_found"}
---    på ett id som inte finns — det bevisar att grinden nås och att admin-kontrollen släppt
---    igenom, utan att röra ett riktigt jobb:
+-- 5) Rökprov som inte rör ett riktigt jobb:
 --    select public.request_publish_site('00000000-0000-0000-0000-000000000000'::uuid, 'exempel.se');
+--
+--    ⚠️ SVARET BEROR PÅ VEM SOM KÖR, och det är lätt att misstolka:
+--      * i SQL-editorn, via MCP eller i `psql` (kor-migrationer.yml) finns ingen JWT.
+--        auth.uid() är då NULL, admin-kontrollen fyrar först, och svaret är
+--        {"ok":false,"error":"forbidden"}. DET ÄR RÄTT SVAR DÄR — det bevisar att
+--        funktionen finns, är anropbar och att grinden stänger för den utan identitet.
+--      * {"ok":false,"error":"not_found"} får du bara via PostgREST med en inloggad
+--        ADMINS token, alltså från portalen. Det är det anropet som bevisar att
+--        admin-kontrollen släpper igenom rätt person.
+--    ⛔ Byt INTE ut noll-UUID:n mot ett riktigt job_id för att "prova på riktigt". Det finns
+--       ingen torrkörningsflagga — anropet publicerar då en kundsajt.
