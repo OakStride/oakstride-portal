@@ -2203,6 +2203,17 @@
     publishing: "Publicerar…", published: "Publicerad", publish_failed: "Publicering misslyckades",
     failed: "Misslyckades"
   };
+  // Felkoder fran request_publish_site (migration 28). RPC:n svarar med kod, inte text,
+  // sa att samma svar gar att lasa bade av portalen och av ett skript.
+  var PUBLISH_FEL = {
+    forbidden: "du saknar adminbehörighet",
+    not_found: "byggjobbet finns inte",
+    not_shared: "koppla en kund och dela utkastet först",
+    bad_status: "jobbet har fel status för publicering",
+    bad_domain: "ogiltig domän",
+    no_pat: "GitHub-nyckeln saknas i Vault",
+    dispatch_failed: "agenten kunde inte startas – jobbet är satt till misslyckat"
+  };
 
   function slugify(s) {
     return String(s || "").toLowerCase()
@@ -2387,15 +2398,16 @@
           }
           if (!window.confirm("Publicera live på " + domain + "?\n\nSajten går live på kundens egna domän. DNS uppdateras (endast webb-poster läggs till – MX/e-post lämnas orört).")) return;
           btn.disabled = true; btn.textContent = "Publicerar…";
-          // Läs briefen, säkerställ att domänen finns i den, och sätt status=publishing (trigger startar agenten).
-          sb.from("build_jobs").select("brief").eq("id", id).single().then(function (g) {
-            var brief = (g && g.data && g.data.brief) || {};
-            brief.domain = domain;
-            sb.from("build_jobs").update({ brief: brief, status: "publishing", error: null }).eq("id", id).then(function (r) {
-              if (r.error) { toast("Kunde inte starta publicering: " + r.error.message, true); btn.disabled = false; btn.textContent = "Publicera"; return; }
-              toast("Publicering startad – " + domain + " går live inom kort.");
-              loadBuildJobs(boxId, customerId);
-            });
+          // Ett uttryckligt anrop startar publiceringen. RPC:n bar behorighetskontrollen,
+          // validerar domanen i databasen, satter brief.domain + status och dispatchar
+          // agenten. Sedan migration 28 finns ingen trigger - ett statusskriv startar
+          // ingenting, och den gamla loopen kan inte uppsta.
+          sb.rpc("request_publish_site", { p_job_id: id, p_domain: domain }).then(function (r) {
+            var fel = r.error ? r.error.message
+                              : (r.data && r.data.ok === false ? (PUBLISH_FEL[r.data.error] || r.data.error) : "");
+            if (fel) { toast("Kunde inte starta publicering: " + fel, true); btn.disabled = false; btn.textContent = "Publicera"; return; }
+            toast("Publicering startad – " + ((r.data && r.data.domain) || domain) + " går live inom kort.");
+            loadBuildJobs(boxId, customerId);
           });
         });
       });
