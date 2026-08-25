@@ -176,10 +176,40 @@ grant  execute on function public.request_publish_site(uuid, text) to authentica
 -- blocket ovan om vad pg_net inte rapporterar. I det läget är jobbet oåtkomligt för
 -- ALLA verktyg som finns: knappen är borta (app.js canPublish saknar 'publishing'),
 -- kortet visar "Publicerar…" för alltid, och stada-testdata.yml vägrar radera.
+-- ⚠️ Funktionen ar admin-JWT-gatad och kan darfor BARA anropas fran portalen. I
+-- SQL-editorn, via MCP eller fran psql ar auth.uid() null och svaret blir 'forbidden'.
+-- Under fonstret "migration 28 kord -> portal-PR #40 mergad" finns alltsa ingen knapp
+-- och ingen anropbar vag: ett jobb som fastnar dar kraver fortfarande handskriven SQL.
+-- Hall fonstret kort.
 -- Den här funktionen är utvägen, och den är avsiktligt trubbig: den flyttar jobbet till
 -- publish_failed, vilket är ett läge portalen redan kan hantera (knappen kommer tillbaka
 -- som "Försök publicera igen") och städverktyget redan får radera.
-create or replace function public.reset_publish_state(p_job_id uuid, p_skal text default null)
+-- ⚠️ TIDSGRINDEN ÄR INTE ADMINISTRATIV. Utan den ar den har funktionen en ny vag till
+-- dubbel publicering, och den utlöses av en knapp som är byggd för att tryckas i
+-- osäkerhet:
+--   1. korning A ar igang, jobbet star pa 'publishing' (fullt normalt i minuter:
+--      git clone, Pages-certifikat, HostUp-zon, DNS)
+--   2. admin blir otalig och trycker Aterstall -> publish_failed
+--   3. 'publish_failed' star i portalens canPublish -> knappen kommer tillbaka som
+--      "Forsok publicera igen"
+--   4. admin trycker -> korning B dispatchas mot SAMMA kundrepo medan A skriver
+--      CNAME och DNS. concurrency har cancel-in-progress: false, sa B koas och kor
+--      klart - tva publiceringar, tva DNS-pass mot kundens zon.
+--   5. samtidigt ar stadverktygets sparr avvapnad: den vagrar bara radera vid
+--      'publishing'. Jobbet kan nu raderas mitt i As korning.
+-- `for update` skyddar mot SAMTIDIGA anrop. Det kan inte skydda mot tva anrop i
+-- foljd som en manniska sjalv slapper igenom. Darfor aldersgrinden nedan.
+--
+-- Signalen finns redan: `updated_at` underhalls av triggern build_jobs_touch
+-- (migration 16) och satts av request_publish_site egen update. Portalen har samma
+-- grind (RESET_EFTER_MIN i app.js) - de tva MASTE folja at, annars visar portalen en
+-- knapp som databasen avvisar.
+--
+-- Skalet skrivs INTE till `error`. Kolumnen ar kundlasbar (samma resonemang som i
+-- request_publish_site ovan), och en admin som skriver "kunden svarar inte, PAT:en
+-- verkar utgangen" som skal hade publicerat det till kunden. Funktionen tar darfor
+-- ingen fritext alls - texten ar fast och kundvand.
+create or replace function public.reset_publish_state(p_job_id uuid)
  returns json
  language plpgsql
  security definer
@@ -188,34 +218,45 @@ as $function$
 declare
   v_is_admin boolean;
   v_status   public.build_status;
+  v_updated  timestamptz;
+  v_alder    interval;
+  c_min_alder constant interval := interval '10 minutes';
 begin
   select coalesce(is_admin, false) into v_is_admin from profiles where id = auth.uid();
   if not coalesce(v_is_admin, false) then
     return json_build_object('ok', false, 'error', 'forbidden');
   end if;
 
-  select status into v_status from build_jobs where id = p_job_id for update;
+  select status, updated_at into v_status, v_updated
+    from build_jobs where id = p_job_id for update;
   if not found then
     return json_build_object('ok', false, 'error', 'not_found');
   end if;
-  -- Bara ett fastnat jobb får återställas. Att kunna slå om vilken status som helst vore
-  -- ett nytt sätt att gå runt statusflödet.
+
+  -- Bara ett fastnat jobb far aterstallas. Att kunna sla om vilken status som helst
+  -- vore ett nytt satt att ga runt statusflodet.
   if v_status::text <> 'publishing' then
     return json_build_object('ok', false, 'error', 'not_publishing', 'status', v_status::text);
   end if;
 
+  v_alder := now() - v_updated;
+  if v_alder < c_min_alder then
+    return json_build_object('ok', false, 'error', 'too_soon',
+                             'alder_sekunder', floor(extract(epoch from v_alder))::bigint,
+                             'kravs_sekunder', floor(extract(epoch from c_min_alder))::bigint);
+  end if;
+
   update build_jobs
      set status = 'publish_failed',
-         error  = coalesce(nullif(btrim(p_skal), ''),
-                           'Publiceringen återställdes manuellt – den hade fastnat utan att starta.')
+         error  = 'Publiceringen återställdes manuellt – den hade fastnat utan att starta.'
    where id = p_job_id;
 
-  return json_build_object('ok', true);
+  return json_build_object('ok', true, 'alder_sekunder', floor(extract(epoch from v_alder))::bigint);
 end $function$;
 
-revoke execute on function public.reset_publish_state(uuid, text) from public;
-revoke execute on function public.reset_publish_state(uuid, text) from anon;
-grant  execute on function public.reset_publish_state(uuid, text) to authenticated, service_role;
+revoke execute on function public.reset_publish_state(uuid) from public;
+revoke execute on function public.reset_publish_state(uuid) from anon;
+grant  execute on function public.reset_publish_state(uuid) to authenticated, service_role;
 
 -- ---------------------------------------------------------------------------
 -- 3. Motorn kopplas bort — triggern och dess funktion släpps
@@ -224,8 +265,13 @@ grant  execute on function public.reset_publish_state(uuid, text) to authenticat
 -- skriver 'publishing' startar ingenting.
 -- Ordningen spelar roll: `drop function` utan `cascade` avbryter med beroendefel så länge
 -- triggern finns kvar, och med `psql -1` faller då hela filen.
--- Uppmätt 2026-08-25: triggern är ENDA referensen till dispatch_publish_site — ingen annan
--- funktion, vy eller constraint nämner den.
+-- Uppmätt 2026-08-25 — kvitto, inte påstående:
+--   select t.tgname, t.tgrelid::regclass::text, t.tgenabled from pg_trigger t
+--    where t.tgfoid = 'public.dispatch_publish_site'::regproc;
+--   -> EN rad: build_jobs_publish_dispatch | build_jobs | O
+--   Ingen funktion, vy eller constraint namner den heller (prosrc, pg_views och
+--   constraintdef genomsokta). `drop function` utan cascade kan alltsa inte falla
+--   filen pa ett beroende vi inte kanner till.
 drop trigger if exists build_jobs_publish_dispatch on public.build_jobs;
 drop function if exists public.dispatch_publish_site();
 
