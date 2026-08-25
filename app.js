@@ -2205,8 +2205,11 @@
   };
   // Sa lange maste ett jobb ha statt i 'publishing' innan Aterstall-knappen visas.
   // MASTE stamma med grinden i reset_publish_state (migration 28) - annars visar
-  // portalen en knapp som databasen avvisar. Tio minuter: en frisk publicering har
-  // aldrig tagit sa lang tid, och Pages-certifikatet ar det langsammaste steget.
+  // portalen en knapp som databasen avvisar. Talet ar MATT, inte kant: 19 korningar av
+  // publish-site.yml 2026-08-25 tog median 17 s och som mest 23 s, med noll kolatens.
+  // Tio minuter ar 26 ganger det langsta som nagonsin mattes. Workflowet har inga
+  // vantloopar och vantar INTE pa Pages-certifikatet (https_enforced satts
+  // fire-and-forget), sa certet forlanger inte korningen.
   var RESET_EFTER_MIN = 10;
   // Aldern raknas ut VID RENDERING. Utan omritning ser en admin som oppnade sidan vid
   // tva minuter "Publicerar... - i 2 min" for alltid, utan knapp - och texten ser ut
@@ -2387,9 +2390,10 @@
           (j.status === "publish_failed" ? "F&ouml;rs&ouml;k publicera igen" : "Publicera") + "</button>";
         if (j.status === "publishing") {
           // Adminen kan inte skilja LANGSAM fran FASTNAD - en frisk publicering tar
-          // minuter (git clone, Pages-certifikat, HostUp-zon, DNS). Darfor tva saker:
-          // minuter (git clone, kundrepo, Pages-API, HostUp-zon, DNS - workflowet
-          // VANTAR daremot inte pa certifikatet). Darfor tva saker: aldern skrivs ut, och knappen finns inte forran jobbet stott
+          // minuter (git clone, kundrepo, Pages-API, HostUp-zon, DNS - workflowet vantar
+          // daremot INTE pa certifikatet). Darfor tva saker: aldern skrivs ut, och
+          // knappen finns inte forran jobbet stott still lange nog att det inte kan vara
+          // normal drift. Utan grinden ar
           // knappen en ny vag till dubbel publicering: aterstall -> publish_failed ->
           // knappen 'Forsok publicera igen' -> en andra korning mot samma kundrepo
           // medan den forsta skriver CNAME och DNS. Databasen har samma grind.
@@ -2401,7 +2405,7 @@
           var minuter = isNaN(startad) ? null : Math.floor((Date.now() - startad) / 60000);
           actions += '<span class="muted">Publicerar… (GitHub Pages + DNS)' +
             (minuter === null || minuter < 0 ? "" : " – i " + minuter + " min") + "</span> ";
-          if (minuter === null || minuter >= RESET_EFTER_MIN) {
+          if (minuter === null || minuter < 0 || minuter >= RESET_EFTER_MIN) {
             actions += '<button class="btn btn-ghost btn-inline" data-reset="' + j.id +
               '" title="' + (minuter === null ? "Okänt hur länge publiceringen har pågått" : "Publiceringen har stått still i " + minuter + " minuter") + '">Fastnat? Återställ</button>';
           }
