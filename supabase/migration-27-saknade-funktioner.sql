@@ -317,9 +317,13 @@ do $vakt$
 begin
   if exists (select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
               where n.nspname = 'public' and p.proname = 'request_publish_site') then
-    -- ::warning:: gor att GitHub Actions lyfter raden som en annotering om den nar
-    -- loggen. Fyrar vakten har ordningen gatt fel, och det ska inte forsvinna i en
-    -- gron logg: kor-migrationer.yml bokfor filen sa fort psql returnerar 0.
+    -- ⚠️ LARMET SYNS BARA I LOGGTEXTEN. Prefixet ::warning:: gor INTE raden till en
+    -- GitHub-annotering: Actions kanner bara igen ett workflow-kommando om raden BORJAR
+    -- med ::, och psql skriver 'WARNING:  ' framfor. Prefixet star kvar som sokstrang -
+    -- kor-migrationer.yml greppar efter det och echo:ar en riktig annotering pa egen rad.
+    -- Fyrar vakten har ordningen gatt fel, och det far inte forsvinna i en gron logg:
+    -- kor-migrationer.yml bokfor filen sa fort psql returnerar 0, och SHA-laset gor att
+    -- den aldrig kors om.
     raise warning '::warning::Migration 28 ar redan kord (request_publish_site finns). Triggern build_jobs_publish_dispatch ateskapas INTE och funktionen dispatch_publish_site slapps igen - den ar avsiktligt borttagen i 28. Detta ar ratt beteende, inte ett fel, men ordningen 27-fore-28 gick fel och bor noteras.';
     -- N3: funktionen ovan aterskapades OVILLKORLIGT nagra rader upp, utanfor vakten.
     -- Utan raden nedan star drift kvar med en `returns trigger`-funktion utan trigger -
