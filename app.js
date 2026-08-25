@@ -2411,12 +2411,15 @@
           }
         }
         if (j.status === "preview_ready" && !j.customer_id) actions = '<span class="muted">Koppla en kund vid bygget för att kunna dela.</span>';
-        // ⚠️ Ocksa vid publish_failed. DNS-receptet ar det enda kunden kan AGERA pa, och
-        // det behovs som mest nar publiceringen INTE gick igenom: agent-PR #21 skriver nu
-        // receptet aven vid fel (eget steg med if: always()), men det renderades bara for
-        // published - sa det nadde databasen och stannade dar.
-        // dns_status !== "ok" star kvar: 'ok' betyder att vi redan skrivit posterna at
-        // kunden, och da ar receptet brus. Ett stoppat jobb rapporterar 'pending', inte 'ok'.
+        // ⚠️ Ocksa vid publish_failed. MOTTAGAREN AR ADMIN, inte kunden - det ar matt:
+        // loadBuildJobs anropas bara fran adminvyerna, och kundens egen hamtning (samma
+        // fil, sok pa customer_id) valjer bara status, shared_at, preview_url och
+        // created_at. Kunden har alltsa ALDRIG sett receptet, inte vid published heller.
+        //
+        // Nyttan ar anda verklig: vid publish_failed sag OakStride ingenting utan att
+        // oppna Action-loggen. Nu star receptet i portalen. Att fa ut det till kunden ar
+        // en egen fraga - kundvyn maste da hamta faltet - och den ar inte tagen.
+        var visaDns = j.status === "published" || j.status === "publish_failed";
         var visaDns = j.status === "published" || j.status === "publish_failed";
         var dnsNote = (visaDns && j.dns_status && j.dns_status !== "ok" && j.dns_instructions)
           ? '<details style="margin-top:.6rem"><summary class="muted">DNS sätts manuellt hos HostUp (rör ej e-post)</summary>' +
