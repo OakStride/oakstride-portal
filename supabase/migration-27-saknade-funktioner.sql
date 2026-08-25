@@ -317,7 +317,16 @@ do $vakt$
 begin
   if exists (select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
               where n.nspname = 'public' and p.proname = 'request_publish_site') then
-    raise warning 'Migration 28 ar redan kord (request_publish_site finns). Triggern build_jobs_publish_dispatch ateskapas INTE - den ar avsiktligt borttagen. Detta ar ratt beteende, inte ett fel.';
+    -- ::warning:: gor att GitHub Actions lyfter raden som en annotering om den nar
+    -- loggen. Fyrar vakten har ordningen gatt fel, och det ska inte forsvinna i en
+    -- gron logg: kor-migrationer.yml bokfor filen sa fort psql returnerar 0.
+    raise warning '::warning::Migration 28 ar redan kord (request_publish_site finns). Triggern build_jobs_publish_dispatch ateskapas INTE och funktionen dispatch_publish_site slapps igen - den ar avsiktligt borttagen i 28. Detta ar ratt beteende, inte ett fel, men ordningen 27-fore-28 gick fel och bor noteras.';
+    -- N3: funktionen ovan aterskapades OVILLKORLIGT nagra rader upp, utanfor vakten.
+    -- Utan raden nedan star drift kvar med en `returns trigger`-funktion utan trigger -
+    -- vilket (a) far migration 28:s eget verifieringssteg 2 att rapportera ett fel som
+    -- inte ar ett fel, och (b) enligt filens EGEN heuristik hogre upp ar en bugg som
+    -- nasta granskning vill laga med ett `create trigger`. Alltsa loopen tillbaka.
+    drop function if exists public.dispatch_publish_site();
   else
     drop trigger if exists build_jobs_publish_dispatch on public.build_jobs;
     create trigger build_jobs_publish_dispatch
