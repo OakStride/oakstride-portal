@@ -2203,6 +2203,49 @@
     publishing: "Publicerar…", published: "Publicerad", publish_failed: "Publicering misslyckades",
     failed: "Misslyckades"
   };
+  // Sa lange maste ett jobb ha statt i 'publishing' innan Aterstall-knappen visas.
+  // MASTE stamma med grinden i reset_publish_state (migration 28) - annars visar
+  // portalen en knapp som databasen avvisar. Talet ar MATT, inte kant: 19 korningar av
+  // publish-site.yml 2026-08-25 tog median 17 s och som mest 23 s, med noll kolatens.
+  // Tio minuter ar 26 ganger det langsta som nagonsin mattes. Workflowet har inga
+  // vantloopar och vantar INTE pa Pages-certifikatet (https_enforced satts
+  // fire-and-forget), sa certet forlanger inte korningen.
+  var RESET_EFTER_MIN = 10;
+  // Aldern raknas ut VID RENDERING. Utan omritning ser en admin som oppnade sidan vid
+  // tva minuter "Publicerar... - i 2 min" for alltid, utan knapp - och texten ser ut
+  // som levande information. Jobbet ar da oatkomligt: publiceringsknappen ar borta,
+  // reset-knappen renderades aldrig, stadverktyget vagrar radera. Enda utvagen vore F5,
+  // och ingenting i granssnittet antyder det.
+  var buildPollTimer = null;
+
+  // Felkoder fran request_publish_site (migration 28). RPC:n svarar med kod, inte text,
+  // sa att samma svar gar att lasa bade av portalen och av ett skript.
+  // Normaliserar en doman EXAKT som request_publish_site gor i databasen (migration 28).
+  // Maste vara identisk: annars kan bekraftelsedialogen visa ett varde och RPC:n
+  // publicera ett annat - och dialogen ar den manskliga grinden for go-live.
+  // ⚠️ Utdata maste vara en FIXPUNKT: vardet skickas in i RPC:n, som normaliserar en
+  //   gang till. Darfor /^(www\.)+/ och inte /^www\./ - annars gav www.www.kund.se
+  //   klientutdata www.kund.se (som dialogen visar) och RPC-utdata kund.se (som
+  //   publiceras). Samma feltyp som blockeraren, en niva ned.
+  // Returnerar "" om domanen ar ogiltig.
+  function normDomain(d) {
+    d = String(d == null ? "" : d).trim().toLowerCase()
+      .replace(/^https?:\/\//, "").replace(/^(www\.)+/, "")
+      .replace(/\/.*$/, "").replace(/\.$/, "");
+    return /^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/.test(d) ? d : "";
+  }
+
+  var PUBLISH_FEL = {
+    forbidden: "du saknar adminbehörighet",
+    not_found: "byggjobbet finns inte",
+    not_shared: "koppla en kund och dela utkastet först",
+    bad_status: "jobbet har fel status för publicering",
+    bad_domain: "ogiltig domän",
+    no_pat: "GitHub-nyckeln saknas i Vault",
+    dispatch_failed: "agenten kunde inte startas – jobbet är satt till misslyckat",
+    not_publishing: "jobbet publiceras inte just nu – inget att återställa",
+    too_soon: "publiceringen har inte stått still länge nog – vänta och försök igen"
+  };
 
   function slugify(s) {
     return String(s || "").toLowerCase()
@@ -2345,9 +2388,39 @@
         if (canPublish) actions += '<button class="btn btn-primary btn-inline" data-publish="' + j.id + '"' +
           (domain ? ' data-domain="' + esc(domain) + '"' : "") + ">" +
           (j.status === "publish_failed" ? "F&ouml;rs&ouml;k publicera igen" : "Publicera") + "</button>";
-        if (j.status === "publishing") actions += '<span class="muted">Publicerar… (GitHub Pages + DNS)</span>';
+        if (j.status === "publishing") {
+          // Adminen kan inte skilja LANGSAM fran FASTNAD - en frisk publicering tar
+          // minuter (git clone, kundrepo, Pages-API, HostUp-zon, DNS - workflowet vantar
+          // daremot INTE pa certifikatet). Darfor tva saker: aldern skrivs ut, och
+          // knappen finns inte forran jobbet stott still lange nog att det inte kan vara
+          // normal drift. Utan grinden ar
+          // knappen en ny vag till dubbel publicering: aterstall -> publish_failed ->
+          // knappen 'Forsok publicera igen' -> en andra korning mot samma kundrepo
+          // medan den forsta skriver CNAME och DNS. Databasen har samma grind.
+          // ⚠️ Failar AT RATT HALL. Saknas updated_at, ar den oparsbar (NaN) eller ligger
+          // i framtiden, visas knappen anda och reset_publish_state far avgora med
+          // too_soon. Klientgrinden ar en bekvamlighet; databasens ar grinden. Att goma
+          // raddningen nar underlaget saknas vore att lasa jobbet av forsiktighet.
+          var startad = j.updated_at ? new Date(j.updated_at).getTime() : NaN;
+          var minuter = isNaN(startad) ? null : Math.floor((Date.now() - startad) / 60000);
+          actions += '<span class="muted">Publicerar… (GitHub Pages + DNS)' +
+            (minuter === null || minuter < 0 ? "" : " – i " + minuter + " min") + "</span> ";
+          if (minuter === null || minuter < 0 || minuter >= RESET_EFTER_MIN) {
+            actions += '<button class="btn btn-ghost btn-inline" data-reset="' + j.id +
+              '" title="' + (minuter === null ? "Okänt hur länge publiceringen har pågått" : "Publiceringen har stått still i " + minuter + " minuter") + '">Fastnat? Återställ</button>';
+          }
+        }
         if (j.status === "preview_ready" && !j.customer_id) actions = '<span class="muted">Koppla en kund vid bygget för att kunna dela.</span>';
-        var dnsNote = (j.status === "published" && j.dns_status && j.dns_status !== "ok" && j.dns_instructions)
+        // ⚠️ Ocksa vid publish_failed. MOTTAGAREN AR ADMIN, inte kunden - det ar matt:
+        // loadBuildJobs anropas bara fran adminvyerna, och kundens egen hamtning (samma
+        // fil, sok pa customer_id) valjer bara status, shared_at, preview_url och
+        // created_at. Kunden har alltsa ALDRIG sett receptet, inte vid published heller.
+        //
+        // Nyttan ar anda verklig: vid publish_failed sag OakStride ingenting utan att
+        // oppna Action-loggen. Nu star receptet i portalen. Att fa ut det till kunden ar
+        // en egen fraga - kundvyn maste da hamta faltet - och den ar inte tagen.
+        var visaDns = j.status === "published" || j.status === "publish_failed";
+        var dnsNote = (visaDns && j.dns_status && j.dns_status !== "ok" && j.dns_instructions)
           ? '<details style="margin-top:.6rem"><summary class="muted">DNS sätts manuellt hos HostUp (rör ej e-post)</summary>' +
             '<pre style="white-space:pre-wrap;font-size:.82rem;margin:.4rem 0 0">' + esc(j.dns_instructions) + "</pre></details>"
           : "";
@@ -2365,6 +2438,13 @@
           dnsNote +
           "</div>";
       }).join("");
+      // Rita om sa lange nagot jobb publiceras, sa att aldern och Aterstall-knappen
+      // foljer klockan. Timern rensas alltid forst - annars ackumuleras en ny per
+      // omladdning och listan borjar rita om sig sjalv i allt tatare takt.
+      if (buildPollTimer) { clearTimeout(buildPollTimer); buildPollTimer = null; }
+      if (rows.some(function (j) { return j.status === "publishing"; })) {
+        buildPollTimer = setTimeout(function () { loadBuildJobs(boxId, customerId); }, 60000);
+      }
       Array.prototype.forEach.call(box.querySelectorAll("[data-share]"), function (btn) {
         btn.addEventListener("click", function () {
           btn.disabled = true; btn.textContent = "Delar…";
@@ -2375,27 +2455,66 @@
           });
         });
       });
+      Array.prototype.forEach.call(box.querySelectorAll("[data-reset]"), function (btn) {
+        btn.addEventListener("click", function () {
+          if (!window.confirm("Återställ jobbet?\n\nKnappen visas först när publiceringen stått still i 10 minuter. Jobbet flyttas till \"Publicering misslyckades\" så att du kan försöka igen eller radera det.")) return;
+          btn.disabled = true; btn.textContent = "Återställer…";
+          sb.rpc("reset_publish_state", { p_job_id: btn.getAttribute("data-reset") }).then(function (r) {
+            var fel = r.error ? r.error.message
+                              : (r.data && r.data.ok === false ? (PUBLISH_FEL[r.data.error] || r.data.error) : "");
+            if (fel) {
+              // too_soon bar bade alder och krav. Den admin som drabbats av en frusen vy
+              // eller en skev klocka ar just den som behover siffran, inte ordet "vänta".
+              if (r.data && r.data.error === "too_soon" && r.data.kravs_sekunder) {
+                var kvar = Math.ceil((r.data.kravs_sekunder - (r.data.alder_sekunder || 0)) / 60);
+                fel += " (försök igen om " + (kvar > 0 ? kvar : 1) + " min)";
+              }
+              toast("Kunde inte återställa: " + fel, true);
+              btn.disabled = false;
+              btn.textContent = "Fastnat? Återställ";
+              // Bada koderna betyder att vyn ar gammal: jobbet publiceras inte langre,
+              // eller finns inte kvar. Att lamna raden orord bjuder in till nya klick.
+              if (r.data && (r.data.error === "not_publishing" || r.data.error === "not_found")) loadBuildJobs(boxId, customerId);
+              return;
+            }
+            toast("Jobbet återställt – du kan försöka publicera igen.");
+            loadBuildJobs(boxId, customerId);
+          });
+        });
+      });
       Array.prototype.forEach.call(box.querySelectorAll("[data-publish]"), function (btn) {
         btn.addEventListener("click", function () {
           var id = btn.getAttribute("data-publish");
-          var domain = btn.getAttribute("data-domain") || "";
+          var domain = normDomain(btn.getAttribute("data-domain") || "");
           if (!domain) {
-            domain = (window.prompt("Kundens domän för go-live (utan https, t.ex. foretag.se):", "") || "").trim()
-              .replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
-            if (!domain) return;
-            if (!/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(domain)) { toast("Ogiltig domän.", true); return; }
+            // Tom ELLER ogiltig data-domain: fraga. Ett ogiltigt varde i briefen fick
+            // tidigare ga vidare helt ovaliderat - klienten kontrollerade bara i
+            // prompt-grenen.
+            var svar = window.prompt("Kundens domän för go-live (utan https, t.ex. foretag.se):", "");
+            if (svar === null) return;          // Avbryt ar inte ett fel - sag ingenting.
+            domain = normDomain(svar);
+            if (!domain) { toast("Ogiltig domän.", true); return; }
           }
           if (!window.confirm("Publicera live på " + domain + "?\n\nSajten går live på kundens egna domän. DNS uppdateras (endast webb-poster läggs till – MX/e-post lämnas orört).")) return;
           btn.disabled = true; btn.textContent = "Publicerar…";
-          // Läs briefen, säkerställ att domänen finns i den, och sätt status=publishing (trigger startar agenten).
-          sb.from("build_jobs").select("brief").eq("id", id).single().then(function (g) {
-            var brief = (g && g.data && g.data.brief) || {};
-            brief.domain = domain;
-            sb.from("build_jobs").update({ brief: brief, status: "publishing", error: null }).eq("id", id).then(function (r) {
-              if (r.error) { toast("Kunde inte starta publicering: " + r.error.message, true); btn.disabled = false; btn.textContent = "Publicera"; return; }
-              toast("Publicering startad – " + domain + " går live inom kort.");
-              loadBuildJobs(boxId, customerId);
-            });
+          // Ett uttryckligt anrop startar publiceringen. RPC:n bar behorighetskontrollen,
+          // validerar domanen i databasen, satter brief.domain + status och dispatchar
+          // agenten. Sedan migration 28 finns ingen trigger - ett statusskriv startar
+          // ingenting, och den gamla loopen kan inte uppsta.
+          sb.rpc("request_publish_site", { p_job_id: id, p_domain: domain }).then(function (r) {
+            var fel = r.error ? r.error.message
+                              : (r.data && r.data.ok === false ? (PUBLISH_FEL[r.data.error] || r.data.error) : "");
+            if (fel) {
+              toast("Kunde inte starta publicering: " + fel, true);
+              btn.disabled = false;
+              btn.textContent = "Publicera";
+              // dispatch_failed har REDAN satt publish_failed i databasen. Utan en
+              // omladdning star chippet, felraden och knapptexten kvar pa gamla varden.
+              if (r.data && ["dispatch_failed", "not_found", "bad_status"].indexOf(r.data.error) !== -1) loadBuildJobs(boxId, customerId);
+              return;
+            }
+            toast("Publicering startad – " + ((r.data && r.data.domain) || domain) + " går live inom kort.");
+            loadBuildJobs(boxId, customerId);
           });
         });
       });
