@@ -1,6 +1,6 @@
 -- Migration 29: skriv ned resten av det som finns i produktion men saknas i repot
 --
--- Version 3. Version 1 blev underkänd på fem punkter, version 2 på två till — alla står
+-- Version 4. Underkänd tre gånger: v1 på fem punkter, v2 på två, v3 på en — alla står
 -- som "RÄTTAT" nedan, med mätningen som avgjorde saken. Läs dem innan du ändrar något här.
 -- Det ena fyndet mot v2 var en regression jag själv införde när jag lagade v1: larmet i
 -- sektion 6 gjorde filen omöjlig att köra i en återuppbyggnad, alltså i det enda scenario
@@ -15,11 +15,16 @@
 --   * `create or replace function`               — se sektion 5, den har ett FÖRKRAV
 --   * inserten i sektion 1                       — villkorad på konflikt, inte på frånvaro
 -- Allt annat är villkorat på att objektet saknas. **Gör filen ändå något larmar den** —
--- men var noga med VAD larmet täcker: sektion 6 jämför före och efter för **tabeller,
--- kolumner, prisraden och funktionskroppens md5**. Policies larmar var för sig i sektion 3,
--- med namn och tabell. Grants räknas INTE — de är mätta som no-ops (se kvittot nedan) och
--- det är ett antagande om drift, inte en vakt. Det var granskningsfynd 4 mot version 2:
--- rubriken lovade "larmar om filen gör något" när sektionen bara täckte fyra sorter.
+-- men var noga med VAD som bevakar vad. Fullständig lista, så att ingen tar bort en vakt
+-- i tron att den är överflödig:
+--   tabeller · kolumner · prisraden · RLS-läget · funktionens md5 → sektion 6
+--   de 15 policyerna                                            → sektion 3, en per policy
+--   droppen av enargumentsversionen                             → egen vakt före droppen
+--   grants (revoke ×3, grant ×2)                                → INGEN vakt
+-- Grants är alltså det enda otäckta, med flit: de är mätta som no-ops (se kvittot nedan),
+-- och det är ett antagande om drift snarare än en kontroll. Säg det, dölj det inte.
+-- ⚠️ Md5-larmet i sektion 6 är ett `raise exception`, inte en varning — det är det enda
+-- läget filen inte kan ångra i efterhand, och transaktionen är öppen när det upptäcks.
 --
 -- ============================ KVITTO PÅ MÄTNINGEN ============================
 -- Allt nedan är uppmätt mot drift 2026-08-27, efter att migration 27 och 28 körts.
@@ -94,12 +99,18 @@ set client_encoding to 'UTF8';
 -- hand statement-för-statement commitas `create temp table` för sig, `on commit drop`
 -- släpper tabellen omedelbart, och sektion 6 dör på "relation _f29_fore does not exist"
 -- EFTER att allt annat redan är applicerat. Filen har körts för hand förut.
-create temp table _f29_fore (
+-- `if not exists` + `delete`: avbryts en HANDKORNING efter den har raden men fore
+-- `drop table` sist, overlever tabellen sessionen (preserve rows) och nasta forsok hade
+-- dott pa "relation _f29_fore already exists" — vid filens forsta riktiga sats. Hogljutt
+-- och sakert, men onodigt. (Granskningsfynd 4 mot v3.)
+create temp table if not exists _f29_fore (
   tabeller  int,
   kolumner  int,
   prisrader bigint,
-  fn_md5    text
+  fn_md5    text,
+  rls_pa    int
 ) on commit preserve rows;
+delete from _f29_fore;
 
 do $$
 declare
@@ -111,7 +122,7 @@ begin
     v_pris := -1;   -- tabellen fanns inte alls: ateruppbyggnad, inte produktion
   end if;
 
-  insert into _f29_fore (tabeller, kolumner, prisrader, fn_md5)
+  insert into _f29_fore (tabeller, kolumner, prisrader, fn_md5, rls_pa)
   select
     (select count(*) from pg_tables where schemaname = 'public'
        and tablename in ('billing_details','extra_work_approvals','pricing_settings','consents')),
@@ -120,7 +131,15 @@ begin
          or (table_name = 'onboarding_checkoffs' and column_name = 'with_extras'))),
     v_pris,
     (select md5(pg_get_functiondef(oid)) from pg_proc
-      where oid = to_regprocedure('public.add_customer_spec_version(text,text,uuid)'));
+      where oid = to_regprocedure('public.add_customer_spec_version(text,text,uuid)')),
+    -- Granskningsfynd 2 mot v3: `enable row level security` ×4 var filens sista
+    -- tillstandsandring UTAN vakt. Matningen 2026-08-27 sager att alla fyra redan har RLS,
+    -- men korningen sker senare an matningen. Andras det daremellan slar filen pa RLS pa en
+    -- livetabell utan ett ord — och `consents` har bara en INSERT-policy, sa dar tystnar
+    -- ALL lasning via API:t i samma sekund.
+    (select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace
+      where n.nspname = 'public' and c.relrowsecurity
+        and c.relname in ('billing_details','extra_work_approvals','pricing_settings','consents'));
 end $$;
 
 -- ---------------------------------------------------------------------------
@@ -405,9 +424,13 @@ grant execute on function public.add_customer_spec_version(text, text, uuid) to 
 do $$
 declare
   f  record;
-  nt int; nk int; npr bigint; nfn text;
+  nt int; nk int; npr bigint; nfn text; nrls int;
 begin
   select * into f from _f29_fore;
+  if not found then
+    raise warning 'migration 29: snapshot-raden saknas — sektion 6 kan inte jamfora nagot. Filen har korts pa ett satt den inte forutser; kontrollera i drift for hand.';
+    return;
+  end if;
   select count(*) into nt from pg_tables where schemaname = 'public'
      and tablename in ('billing_details','extra_work_approvals','pricing_settings','consents');
   select count(*) into nk from information_schema.columns where table_schema = 'public'
@@ -416,6 +439,9 @@ begin
   select count(*) into npr from public.pricing_settings;
   select md5(pg_get_functiondef(oid)) into nfn from pg_proc
    where oid = to_regprocedure('public.add_customer_spec_version(text,text,uuid)');
+  select count(*) into nrls from pg_class c join pg_namespace n on n.oid = c.relnamespace
+   where n.nspname = 'public' and c.relrowsecurity
+     and c.relname in ('billing_details','extra_work_approvals','pricing_settings','consents');
 
   if nt <> f.tabeller then
     raise warning 'migration 29 SKAPADE % tabell(er) (% -> %). I produktion ska den siffran vara oforandrad.', nt - f.tabeller, f.tabeller, nt;
@@ -426,12 +452,31 @@ begin
   if f.prisrader >= 0 and npr <> f.prisrader then
     raise warning 'migration 29 SATTE IN prisraden (% -> %). I produktion ska den redan finnas.', f.prisrader, npr;
   end if;
-  if f.fn_md5 is not null and nfn is distinct from f.fn_md5 then
-    raise warning 'migration 29 ANDRADE add_customer_spec_version (md5 % -> %). Forkravet i sektion 5 skulle ha stoppat detta - kontrollera funktionen i drift OMEDELBART.', f.fn_md5, nfn;
+  if f.rls_pa is not null and nrls <> f.rls_pa then
+    raise warning 'migration 29 SLOG PA RLS pa % tabell(er) (% -> % av 4). I produktion ska alla fyra redan ha RLS. Kontrollera att de har policies - en tabell med RLS men utan SELECT-policy ar tyst for API:t.', nrls - f.rls_pa, f.rls_pa, nrls;
   end if;
+
+  -- 🔴 EXCEPTION, inte warning (granskningsfynd 1 mot v3). Forkravet i sektion 5
+  -- kontrollerar att DRIFT matchar den vantade md5:an — inte att FILEN gor det. Glider
+  -- transkriberingen (dalig merge, editor som normaliserar blanktecken, nagon som "stadar"
+  -- indenteringen) passerar forkravet, `create or replace` skriver den andrade kroppen, och
+  -- det ar HAR det upptacks. Filen kor med `-1`, alltsa ar transaktionen fortfarande oppen:
+  -- ett exception rullar tillbaka overskrivningen fullstandigt. Att i stallet varna och
+  -- commita vore att lamna ifran sig en aterstallning som ligger en rad bort — och
+  -- originalkroppen finns da bara som en 32 tecken lang hash.
+  --
+  -- ⚠️ De andra larmen i sektionen ska FORBLI varningar: tabeller, kolumner, prisraden och
+  -- RLS ar additiva och FORVANTAS skilja sig i en ateruppbyggnad. Ett avbrott dar hade
+  -- brutit rebuild-vagen igen. Md5-fallet ar av annan art: i en ateruppbyggnad ar f.fn_md5
+  -- NULL och grenen hoppas over, sa detta exception kan inte traffa den vagen.
+  if f.fn_md5 is not null and nfn is distinct from f.fn_md5 then
+    raise exception 'migration 29 AVBRYTER: add_customer_spec_version andrades av den har filen (md5 % -> %). Forkravet i sektion 5 sag att DRIFT var orord, sa det ar FILENS kropp som glidit. Allt rullas tillbaka. Jamfor filen mot pg_get_functiondef innan du forsoker igen.', f.fn_md5, nfn;
+  end if;
+
   if nt = f.tabeller and nk = f.kolumner and (f.prisrader < 0 or npr = f.prisrader)
-     and (f.fn_md5 is null or nfn is not distinct from f.fn_md5) then
-    raise notice 'migration 29: no-op bekraftad — inga tabeller, kolumner eller rader tillkom, och funktionen ar oforandrad. Policies larmar var for sig i sektion 3.';
+     and (f.fn_md5 is null or nfn is not distinct from f.fn_md5)
+     and (f.rls_pa is null or nrls = f.rls_pa) then
+    raise notice 'migration 29: no-op bekraftad — inga tabeller, kolumner eller rader tillkom, RLS oforandrad, funktionen oforandrad. Policies larmar var for sig i sektion 3.';
   end if;
 end $$;
 
@@ -471,3 +516,11 @@ drop table _f29_fore;
 --
 -- 5. Ta med minst en rad du VET ska ge traff i varje kontrollfraga. Ett kontrollsteg som
 --    ljuger blir brus, och da fangar det inte ett akta glapp heller.
+--
+-- 6. ⚠️ TVA LITTERALER STAR PA TRE STALLEN VAR. Andrar du den ena men inte de andra far du
+--    ett kontrollsteg som ljuger — precis det punkt 5 varnar for:
+--      * signaturen 'public.add_customer_spec_version(text,text,uuid)'
+--        (snapshot-blocket, forkravet i sektion 5, efterkontrollen i sektion 6)
+--      * md5:an '9ebea1d75d0296e050f4ecdd13180e3c'
+--        (kvittot i huvudet, forkravet i sektion 5, kommentaren ovanfor funktionskroppen)
+--    Ren SQL har inga variabler att binda dem till. Andra alla tre, varje gang.
