@@ -1,7 +1,10 @@
 -- Migration 29: skriv ned resten av det som finns i produktion men saknas i repot
 --
--- Version 2. Version 1 blev underkänd på fem punkter — de står som "RÄTTAT" nedan, med
--- mätningen som gjordes för att avgöra saken. Läs dem innan du ändrar något här.
+-- Version 3. Version 1 blev underkänd på fem punkter, version 2 på två till — alla står
+-- som "RÄTTAT" nedan, med mätningen som avgjorde saken. Läs dem innan du ändrar något här.
+-- Det ena fyndet mot v2 var en regression jag själv införde när jag lagade v1: larmet i
+-- sektion 6 gjorde filen omöjlig att köra i en återuppbyggnad, alltså i det enda scenario
+-- den finns för. En fix kan gå sönder på ett nytt sätt; granska varje version för sig.
 --
 -- ⚠️ FILEN SKA VARA EN NO-OP MOT PRODUKTION, men den är det inte genom att varje sats är
 -- villkorad — det påstod version 1, och det var osant. Följande satser är VILLKORSLÖSA:
@@ -11,8 +14,12 @@
 --   * `revoke` ×3 och `grant` ×2                 — idempotenta, men körs alltid
 --   * `create or replace function`               — se sektion 5, den har ett FÖRKRAV
 --   * inserten i sektion 1                       — villkorad på konflikt, inte på frånvaro
--- Allt annat är villkorat på att objektet saknas. **Och om filen ändå gör något larmar
--- den** — se sektion 6, som jämför läget före och efter och skriker med `raise warning`.
+-- Allt annat är villkorat på att objektet saknas. **Gör filen ändå något larmar den** —
+-- men var noga med VAD larmet täcker: sektion 6 jämför före och efter för **tabeller,
+-- kolumner, prisraden och funktionskroppens md5**. Policies larmar var för sig i sektion 3,
+-- med namn och tabell. Grants räknas INTE — de är mätta som no-ops (se kvittot nedan) och
+-- det är ett antagande om drift, inte en vakt. Det var granskningsfynd 4 mot version 2:
+-- rubriken lovade "larmar om filen gör något" när sektionen bara täckte fyra sorter.
 --
 -- ============================ KVITTO PÅ MÄTNINGEN ============================
 -- Allt nedan är uppmätt mot drift 2026-08-27, efter att migration 27 och 28 körts.
@@ -54,7 +61,7 @@
 -- 🔴 `kor-migrationer.yml` globbar BARA `migration-*.sql`. **`schema.sql` körs aldrig av
 --   den.** Där ligger `profiles`, `requests`, `request_comments` och `is_admin()` — som
 --   den här filen är helt beroende av. `migration-1` och `migration-4` finns dessutom
---   inte som filer alls (migration-3 rad 88 hänvisar till en "migration 4, körd
+--   inte som filer alls (migration-3 rad 89 hänvisar till en "migration 4, körd
 --   2026-07-17"). En återuppbyggnad är alltså: schema.sql för hand FÖRST, sedan
 --   migrationerna i nummerordning. Det är inte en väg någon provat.
 --
@@ -71,15 +78,50 @@
 set client_encoding to 'UTF8';
 
 -- Fångar läget FÖRE. Sektion 6 jämför mot det och larmar om filen gjorde något.
-create temp table _f29_fore on commit drop as
-select
-  (select count(*) from pg_tables where schemaname = 'public'
-     and tablename in ('billing_details','extra_work_approvals','pricing_settings','consents')) as tabeller,
-  (select count(*) from information_schema.columns where table_schema = 'public'
-     and ((table_name = 'requests'             and column_name in ('change_items','change_note'))
-       or (table_name = 'onboarding_checkoffs' and column_name = 'with_extras'))) as kolumner,
-  (select count(*) from pg_policies where schemaname = 'public') as policies,
-  (select count(*) from public.pricing_settings) as prisrader;
+--
+-- 🔴 RÄTTAT (granskningsfynd mot v2, en regression jag själv införde): detta var förut
+-- `create temp table _f29_fore on commit drop as select ... from public.pricing_settings`.
+-- Den tabellen skapas först längre ned i DEN HÄR filen. `CREATE TABLE AS SELECT` planerar
+-- sin SELECT innan den kör, så i en tom databas byggd ur repot avbryts satsen med
+-- `relation "public.pricing_settings" does not exist`, ON_ERROR_STOP fyrar, -1 rullar
+-- tillbaka — och migration 29 kör aldrig. Filen fungerade alltså mot produktion men inte
+-- i det enda scenario den finns för. `case when to_regclass(...)` hjälper inte:
+-- relationsreferenser slås upp vid parsning även i en gren som aldrig körs. Dynamisk SQL
+-- i ett DO-block är det som fungerar.
+--
+-- ⚠️ `on commit preserve rows` + explicit drop sist, inte `on commit drop`. Under
+-- kor-migrationer.yml körs filen som `psql -1 -f` och skillnaden är noll. Körs den för
+-- hand statement-för-statement commitas `create temp table` för sig, `on commit drop`
+-- släpper tabellen omedelbart, och sektion 6 dör på "relation _f29_fore does not exist"
+-- EFTER att allt annat redan är applicerat. Filen har körts för hand förut.
+create temp table _f29_fore (
+  tabeller  int,
+  kolumner  int,
+  prisrader bigint,
+  fn_md5    text
+) on commit preserve rows;
+
+do $$
+declare
+  v_pris bigint;
+begin
+  if to_regclass('public.pricing_settings') is not null then
+    execute 'select count(*) from public.pricing_settings' into v_pris;
+  else
+    v_pris := -1;   -- tabellen fanns inte alls: ateruppbyggnad, inte produktion
+  end if;
+
+  insert into _f29_fore (tabeller, kolumner, prisrader, fn_md5)
+  select
+    (select count(*) from pg_tables where schemaname = 'public'
+       and tablename in ('billing_details','extra_work_approvals','pricing_settings','consents')),
+    (select count(*) from information_schema.columns where table_schema = 'public'
+       and ((table_name = 'requests'             and column_name in ('change_items','change_note'))
+         or (table_name = 'onboarding_checkoffs' and column_name = 'with_extras'))),
+    v_pris,
+    (select md5(pg_get_functiondef(oid)) from pg_proc
+      where oid = to_regprocedure('public.add_customer_spec_version(text,text,uuid)'));
+end $$;
 
 -- ---------------------------------------------------------------------------
 -- 1. Tabeller som ingen fil beskriver
@@ -224,6 +266,16 @@ grant execute on function public.oak_send_email(text, text, text) to service_rol
 -- sa droppen ar en no-op i produktion. Den behovs bara i en ateruppbyggnad, dar
 -- migration-12 hinner skapa den forst. DROP FUNCTION matchar pa exakt argumenttyplista,
 -- sa treargumentsversionen ar oatkomlig for satsen.
+-- RÄTTAT (granskningsfynd 3 mot v2): droppen ar filens ENDA oaterkalleliga sats, och den
+-- var den enda utan vakt och utan larm. Sektion 6 tittar inte pa funktioner. Andrades
+-- tillstandet mellan matningen 2026-08-27 och korningen forsvinner en funktion utan ett ord.
+do $$
+begin
+  if to_regprocedure('public.add_customer_spec_version(text)') is not null then
+    raise warning 'migration 29 DROPPAR enargumentsversionen av add_customer_spec_version. Den var uppmatt som FRANVARANDE i drift 2026-08-27 - i produktion ska den har raden inte fyra.';
+  end if;
+end $$;
+
 drop function if exists public.add_customer_spec_version(text);
 
 -- RÄTTAT (granskningsfynd 5): `create or replace` nedan är villkorslös, och version 1 la
@@ -236,10 +288,19 @@ do $$
 declare
   v_md5 text;
 begin
-  select md5(pg_get_functiondef(p.oid)) into v_md5
-    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-   where n.nspname = 'public'
-     and p.oid::regprocedure::text = 'add_customer_spec_version(text,text,uuid)';
+  -- 🔴 RÄTTAT (granskningsfynd 2 mot v2): stod förut
+  -- `p.oid::regprocedure::text = 'add_customer_spec_version(text,text,uuid)'`.
+  -- `regprocedure`s rendering utelämnar schemat ENDAST när funktionen är synlig i
+  -- sessionens search_path. Ligger inte `public` där renderas den som
+  -- `public.add_customer_spec_version(...)`, villkoret matchar aldrig, v_md5 blir NULL —
+  -- och blocket faller i "fanns inte, skapas nu"-grenen och SLÄPPER IGENOM
+  -- överskrivningen. En vakt vars felläge är "släpp igenom" tar tillbaka precis den flytt
+  -- av kontrollen till före skadan som den finns för. Filen pinnar client_encoding av
+  -- samma skäl men lämnade search_path fritt. `to_regprocedure` är schemaexplicit,
+  -- oberoende av search_path, och ger NULL i stället för att kasta när funktionen saknas.
+  select md5(pg_get_functiondef(oid)) into v_md5
+    from pg_proc
+   where oid = to_regprocedure('public.add_customer_spec_version(text,text,uuid)');
 
   if v_md5 is null then
     -- Finns inte: aterupbyggnad. Skapandet nedan ar da hela poangen.
@@ -332,10 +393,19 @@ grant execute on function public.add_customer_spec_version(text, text, uuid) to 
 -- Händer något ändå ska det INTE gå att missa: kor-migrationer.yml lyfter WARNING till
 -- en Actions-annotering, medan en NOTICE drunknar i loggtexten. Efter körningen är filen
 -- dessutom bokförd med SHA-lås och kan aldrig köras om — larmet är enda spåret.
+-- RÄTTAT (granskningsfynd 5 mot v2): policyräknaren är BORTTAGEN. Den räknade alla 54
+-- policies i public, inte bara mina 15 — en nettosiffra över en supermängd. Skapar filen
+-- en av sina 15 samtidigt som något annat tar bort en orelaterad policy blir differensen
+-- noll och larmet fyrar aldrig (READ COMMITTED, så efter-frågan ser andra sessioners
+-- commits). Den kunde alltså både falsklarma och maskera. Policy-blocket i sektion 3
+-- larmar redan PER SKAPAD POLICY, med namn och tabell — strängt mer information.
+--
+-- RÄTTAT (granskningsfynd 4 mot v2): funktionskroppens md5 jämförs nu här också. Förut
+-- gates den bara av förkravet i sektion 5, och rubriken lovade mer än sektionen höll.
 do $$
 declare
   f  record;
-  nt int; nk int; np int; npr int;
+  nt int; nk int; npr bigint; nfn text;
 begin
   select * into f from _f29_fore;
   select count(*) into nt from pg_tables where schemaname = 'public'
@@ -343,8 +413,9 @@ begin
   select count(*) into nk from information_schema.columns where table_schema = 'public'
      and ((table_name = 'requests'             and column_name in ('change_items','change_note'))
        or (table_name = 'onboarding_checkoffs' and column_name = 'with_extras'));
-  select count(*) into np  from pg_policies where schemaname = 'public';
   select count(*) into npr from public.pricing_settings;
+  select md5(pg_get_functiondef(oid)) into nfn from pg_proc
+   where oid = to_regprocedure('public.add_customer_spec_version(text,text,uuid)');
 
   if nt <> f.tabeller then
     raise warning 'migration 29 SKAPADE % tabell(er) (% -> %). I produktion ska den siffran vara oforandrad.', nt - f.tabeller, f.tabeller, nt;
@@ -352,16 +423,19 @@ begin
   if nk <> f.kolumner then
     raise warning 'migration 29 LADE TILL % kolumn(er) (% -> %). I produktion ska den siffran vara oforandrad.', nk - f.kolumner, f.kolumner, nk;
   end if;
-  if np <> f.policies then
-    raise warning 'migration 29 SKAPADE % policy/policies (% -> %). I produktion ska den siffran vara oforandrad.', np - f.policies, f.policies, np;
-  end if;
-  if npr <> f.prisrader then
+  if f.prisrader >= 0 and npr <> f.prisrader then
     raise warning 'migration 29 SATTE IN prisraden (% -> %). I produktion ska den redan finnas.', f.prisrader, npr;
   end if;
-  if nt = f.tabeller and nk = f.kolumner and np = f.policies and npr = f.prisrader then
-    raise notice 'migration 29: no-op bekraftad — inga tabeller, kolumner, policies eller rader tillkom.';
+  if f.fn_md5 is not null and nfn is distinct from f.fn_md5 then
+    raise warning 'migration 29 ANDRADE add_customer_spec_version (md5 % -> %). Forkravet i sektion 5 skulle ha stoppat detta - kontrollera funktionen i drift OMEDELBART.', f.fn_md5, nfn;
+  end if;
+  if nt = f.tabeller and nk = f.kolumner and (f.prisrader < 0 or npr = f.prisrader)
+     and (f.fn_md5 is null or nfn is not distinct from f.fn_md5) then
+    raise notice 'migration 29: no-op bekraftad — inga tabeller, kolumner eller rader tillkom, och funktionen ar oforandrad. Policies larmar var for sig i sektion 3.';
   end if;
 end $$;
+
+drop table _f29_fore;
 
 -- ---------------------------------------------------------------------------
 -- 7. VERIFIERING — kor detta EFTER migrationen
