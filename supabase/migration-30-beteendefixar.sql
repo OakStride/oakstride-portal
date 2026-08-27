@@ -52,22 +52,57 @@ set client_encoding to 'UTF8';
 -- genom skal, heredoc, Python eller JSON. Repots version har rätt regex; det är DRIFT som
 -- glidit. Den här filen tar drift tillbaka till repots avsikt.
 --
--- 🟡 VAD SOM FAKTISKT ÄNDRAS I VÄRLDEN: `normalize_page_view` normaliserar `page_views.site`
--- vid INSERT, och `site_stats` matchar mot `profiles.website`. Efter fixen hamnar ett besök
--- på `www.kund.se` under `kund.se` i stället för under ett eget värde. **Vilande i dag:**
--- noll rader i `page_views` har www-prefix och det finns tre distinkta `site`. Fixen
--- behöver alltså ingen datamigrering nu — men den behövs INNAN en kundsajt nås på både
--- apex och www, för då delas besöken i två och statistiken blir fel utan att larma.
+-- 🟡 VAD SOM FAKTISKT ÄNDRAS I VÄRLDEN — TVÅ AXLAR, INTE EN.
 --
--- ✅ Kontrollerat 2026-08-27 att ändringen inte kan korrumpera något: `norm_host` används
--- INTE i något index, ingen genererad kolumn och ingen constraint. Bara två funktioner
--- anropar den — `site_stats` och `normalize_page_view` — och båda läser.
+-- **Axel 1, gruppering.** `normalize_page_view` normaliserar `page_views.site` vid INSERT.
+-- Efter fixen hamnar ett besök på `www.kund.se` under `kund.se`. Vilande i dag: noll rader
+-- har www-prefix (mätt). Behövs INNAN en kundsajt nås på både apex och www — då delas
+-- besöken annars i två och statistiken blir fel utan att larma.
+--
+-- 🔴 **Axel 2, AUKTORISERING — den missade jag först, granskaren fann den.**
+-- `site_stats` är `security definer` och använder `norm_host` som halva sitt behörighetsvillkor
+-- (`migration-3-stats.sql` rad 45–56):
+--     where id = auth.uid() and (is_admin or public.norm_host(website) = host)
+-- `norm_host` avgör alltså **vem som får läsa statistik för vilken sajt**. Efter fixen:
+--   * en kund vars `profiles.website` är `www.kund.se` kan anropa `site_stats('kund.se')`
+--     och får svar — i dag nekas det;
+--   * två profiler vars websites skiljer sig bara på `www.` normaliseras till SAMMA värde
+--     och delar därmed statistikomfång.
+--
+-- **Uppmätt kollisionsyta 2026-08-27, före körning:**
+--   profiler med `www.` i website ............................. 0
+--   kollisionsgrupper under GAMLA normaliseringen ............. 1  (två profiler, båda `oakstride.se`)
+--   kollisionsgrupper under NYA normaliseringen ............... 1  (samma två, samma värde)
+-- Kollisionen är alltså **pre-existerande och oförändrad av den här filen** — den beror på två
+-- identiska värden på vår egen domän, inte på www. **Fixen skapar ingen ny delning.**
+--
+-- Taket för risken är dessutom begränsat: `protect_profile_cols` (migration-24 rad 33) sätter
+-- `new.website := old.website` för alla utom admin, så en kund kan inte peka sin profil mot
+-- någon annans domän. En kollision måste skapas av admin.
+--
+-- ✅ Beroenden kontrollerade mot katalogen, inte mot en handskriven lista (granskarens form):
+--     select pg_describe_object(classid, objid, objsubid), deptype from pg_depend
+--      where refclassid='pg_proc'::regclass
+--        and refobjid = to_regprocedure('public.norm_host(text)') and deptype <> 'i';
+--   Utfall 2026-08-27: **noll rader.** Inget index, ingen generad kolumn, ingen constraint,
+--   ingen vy, ingen policy, ingen statistik och inget partitionsuttryck hänger på funktionen.
+--
+-- ℹ️ `set search_path to 'public'` nedan är INTE en tredje ändring: **drift har den redan**
+--   (mätt med `pg_get_functiondef` 2026-08-27). Det är repots `migration-3-stats.sql` som
+--   saknar klausulen. Den nya definitionen återger alltså drift, inte repot, på den punkten.
 
 do $$
 begin
   if to_regprocedure('public.norm_host(text)') is null then
     raise exception 'migration 30 AVBRYTER: norm_host(text) finns inte i drift. Filen ar skriven mot en funktion som ska finnas - kontrollera vad som hant innan du kor om.';
   end if;
+  -- Villkoret som gor fixen ofarlig maste galla VID KORNING, inte bara vid matningen.
+  -- Dyker en www-rad upp daremellan blir den kundens historik osynlig for site_stats, som
+  -- efter fixen slar upp 'kund.se' medan raden lagrats som 'www.kund.se'. Tyst bortfall.
+  if exists (select 1 from public.page_views where site like 'www.%') then
+    raise exception 'migration 30 AVBRYTER: page_views innehaller rader med www-prefix. Fixen skulle gora dem osynliga for site_stats. Normalisera dem forst, kor sedan om.';
+  end if;
+
   -- Beteendeprov: felet SKA finnas innan vi lagar det.
   if public.norm_host('https://www.Example.com/nagot') <> 'www.example.com' then
     raise exception 'migration 30 AVBRYTER: norm_host beter sig inte som uppmatt 2026-08-27. Vantat "www.example.com" (alltsa buggen), fick "%". Nagon har redan andrat funktionen - las den med pg_get_functiondef och avgor for hand om fixen fortfarande behovs.', public.norm_host('https://www.Example.com/nagot');
@@ -97,7 +132,11 @@ $function$;
 --
 -- ✅ Portalen behöver INTE de rättigheterna. Kontrollerat i `portal/app.js`:
 --     insert  rad 1728, 1753, 1796
---     select  rad 1478 (kundens egen), 2493 (adminvyn)
+--     select  rad 1478 (kundens egen), 2612 och 2736 (adminvyerna)
+--   ⚠️ Rattat: forsta versionen angav rad 2493 som en adminvy. Den raden ror inte tabellen
+--   alls — den ar en go-live-prompt — och de tva verkliga admin-selecterna saknades. Bada
+--   tacks av "extra-godk: admin laser", sa slutsatsen holl, men listan ar sjalva
+--   sakerhetsargumentet och far darfor inte peka pa en oskyldig rad.
 --   Ingenting uppdaterar eller raderar en rad. Policyn kan därför smalnas till SELECT +
 --   INSERT utan att något slutar fungera.
 --
@@ -109,19 +148,42 @@ $function$;
 -- ⚠️ Drop och create ligger i samma transaktion, så det finns inget fönster där tabellen
 -- saknar policy.
 
+-- 🔴 FORKRAVET PROVAR HELA DET TILLSTAND SOM FORSTORS, inte bara namnet.
+-- Forsta versionen las bara `cmd`. Hade nagon andrat policyns VILLKOR sedan matningen -
+-- smalnat det, vidgat det, lagt till ett tidsvillkor - hade forkravet passerat, `drop policy`
+-- rivit den, och de tva nya skapats ur den DOKUMENTERADE lydelsen. Den gamla villkorstexten
+-- finns ingenstans i repot, sa den hade inte gatt att aterstalla.
+--
+-- Det ar samma svaghet som granskaren fallde i migration 29 - namnmatchning kan inte upptacka
+-- att en policy med ratt namn har fel villkor - men dar var foljden att filen HOPPADE OVER
+-- policyn. Har ar foljden att den RADERAS. Samma brist, allvarligare utfall, i en fil vars
+-- hela premiss ar att forkraven ska bevisa att utgangslaget ar det som mattes.
+--
+-- Uppmatt i drift 2026-08-27, och det ar dessa varden forkravet krav:
+--   cmd = ALL · permissive = PERMISSIVE · roles = {public}
+--   qual       = (user_id = auth.uid())
+--   with_check = (user_id = auth.uid())
 do $$
 declare
-  v_cmd text;
+  r record;
 begin
-  select cmd into v_cmd from pg_policies
+  select cmd, permissive, roles::text as roles, qual, with_check into r
+    from pg_policies
    where schemaname = 'public' and tablename = 'extra_work_approvals'
      and policyname = 'extra-godk: kund hanterar egna';
 
-  if v_cmd is null then
+  if not found then
     raise exception 'migration 30 AVBRYTER: policyn "extra-godk: kund hanterar egna" finns inte pa extra_work_approvals. Den var uppmatt 2026-08-27 - nagon har redan tagit bort eller dopt om den. Las pg_policies och avgor for hand.';
   end if;
-  if v_cmd <> 'ALL' then
-    raise exception 'migration 30 AVBRYTER: policyn ar redan smalnad (cmd = %, vantat ALL). Ingenting att gora - kontrollera att de tva nya policyerna finns i stallet.', v_cmd;
+  if r.cmd <> 'ALL' then
+    raise exception 'migration 30 AVBRYTER: policyn ar redan smalnad (cmd = %, vantat ALL). Ingenting att gora - kontrollera att de tva nya policyerna finns i stallet.', r.cmd;
+  end if;
+  if r.permissive <> 'PERMISSIVE' or r.roles <> '{public}' then
+    raise exception 'migration 30 AVBRYTER: policyn har andrats sedan matningen (permissive = %, roles = %; vantat PERMISSIVE och {public}). Filen river en policy den inte langre kanner igen - las pg_policies och avgor for hand.', r.permissive, r.roles;
+  end if;
+  if r.qual is distinct from '(user_id = auth.uid())'
+     or r.with_check is distinct from '(user_id = auth.uid())' then
+    raise exception 'migration 30 AVBRYTER: policyns VILLKOR har andrats sedan 2026-08-27. Drift har nu qual = %, with_check = %. Filen skulle ha rivit det och ersatt det med den dokumenterade lydelsen - alltsa tappat nagon annans andring utan spar. Las villkoret, avgor for hand vad som ska galla, och skriv en ny migration.', coalesce(r.qual,'(null)'), coalesce(r.with_check,'(null)');
   end if;
 end $$;
 
@@ -140,6 +202,11 @@ create policy "extra-godk: kund godkänner"
 -- och den andrar ingenting i praktiken: `auth.uid()` ar NULL for `anon`, sa villkoret
 -- `user_id = auth.uid()` var redan falskt for en utloggad besokare. Skillnaden ar att
 -- rollistan nu sager samma sak som villkoret, i stallet for att forlita sig pa det.
+-- ⚠️ Select-policyn behaller `to public` medan insert stramas at. Asymmetrin ar avsiktlig men
+-- odramatisk: bada villkoren ar `user_id = auth.uid()`, som ar falskt for `anon` oavsett
+-- rollista. Jag lat select sta kvar for att den ar identisk i form med de tva admin-policyerna
+-- pa samma tabell, som ocksa ar `to public` - en enda avvikande rollista har varit svarare att
+-- lasa an en konsekvent.
 
 -- ---------------------------------------------------------------------------
 -- 3. EFTERKONTROLL — bevisa att båda ändringarna tog
@@ -158,10 +225,15 @@ begin
     raise exception 'migration 30 AVBRYTER: norm_host ger fortfarande "%" efter fixen, vantat "example.com". Regexet tog inte.', v_host;
   end if;
 
+  -- Invarianten ar "ingen kundnabar UPDATE- eller DELETE-vag finns kvar", inte "ingen FOR ALL
+  -- for public". Forsta versionen provade det senare och hade darfor slappt igenom bade en
+  -- FOR ALL till authenticated och en ren UPDATE- eller DELETE-policy. Kontrollen kunde alltsa
+  -- ga igenom medan halet stod kvar - ett kontrollsteg som ljuger.
   select count(*) into v_all from pg_policies
-   where schemaname='public' and tablename='extra_work_approvals' and cmd='ALL' and roles::text like '%public%';
+   where schemaname='public' and tablename='extra_work_approvals'
+     and cmd in ('ALL','UPDATE','DELETE');
   if v_all > 0 then
-    raise exception 'migration 30 AVBRYTER: det finns fortfarande % FOR ALL-policy pa extra_work_approvals for public. Kunden kan da alltjamt radera sitt godkannande.', v_all;
+    raise exception 'migration 30 AVBRYTER: det finns fortfarande % policy med cmd ALL, UPDATE eller DELETE pa extra_work_approvals. Nagon kan da alltjamt andra eller radera ett godkannande.', v_all;
   end if;
 
   select count(*) into v_nya from pg_policies
@@ -187,6 +259,11 @@ end $$;
 --   --   "extra-godk: admin skapar"  INSERT   (fanns forut, ororad)
 --   --   "extra-godk: kund läser egna" SELECT (ny, ersatter halva den gamla)
 --   --   "extra-godk: kund godkänner"  INSERT (ny, ersatter andra halvan)
+--
+-- ⚠️ MIGRATION 29:s VERIFIERINGSPUNKT 2 GALLER INTE LANGRE FOR DEN HAR TABELLEN.
+--    Den sager "jamfor policyerna rad for rad mot sektion 3, villkoren ska vara identiska".
+--    Efter den har filen finns "extra-godk: kund hanterar egna" inte kvar - den ar ersatt av
+--    tva smalare. Migration 29 ar SHA-last och kan inte rattas; darfor star det har i stallet.
 --
 -- ⚠️ Anvand inte `like 'migration-3[0]%'` for att kolla liggaren - LIKE kanner inte
 --    teckenklasser. Ratt form: `filnamn ~ '^migration-30-'`.
