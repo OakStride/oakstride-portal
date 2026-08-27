@@ -1,42 +1,92 @@
 -- Migration 29: skriv ned resten av det som finns i produktion men saknas i repot
 --
--- ⚠️ DEN HÄR FILEN ÄNDRAR INGENTING I DRIFT. Varje sats är villkorad på att objektet
--- saknas. Kör den mot produktion och ingenting händer — det är hela poängen. Den finns
--- för att en databas som byggs UR REPOT ska bli densamma som den som körs.
+-- Version 2. Version 1 blev underkänd på fem punkter — de står som "RÄTTAT" nedan, med
+-- mätningen som gjordes för att avgöra saken. Läs dem innan du ändrar något här.
 --
--- Migration 27 gjorde samma sak för funktioner, enum, kolumner, trigger och grants, och
--- sa uttryckligen att policies och index INTE var mätta. Den här filen tar resten.
+-- ⚠️ FILEN SKA VARA EN NO-OP MOT PRODUKTION, men den är det inte genom att varje sats är
+-- villkorad — det påstod version 1, och det var osant. Följande satser är VILLKORSLÖSA:
+--   * `set client_encoding` (rad nedan)          — ofarlig, men körs alltid
+--   * `alter table ... enable row level security` ×4 — no-op i innehåll, men tar
+--     ACCESS EXCLUSIVE-lås en kort stund på fyra livetabeller
+--   * `revoke` ×3 och `grant` ×2                 — idempotenta, men körs alltid
+--   * `create or replace function`               — se sektion 5, den har ett FÖRKRAV
+--   * inserten i sektion 1                       — villkorad på konflikt, inte på frånvaro
+-- Allt annat är villkorat på att objektet saknas. **Och om filen ändå gör något larmar
+-- den** — se sektion 6, som jämför läget före och efter och skriker med `raise warning`.
 --
--- ============================ VAD SOM ÄR MÄTT, OCH NÄR ============================
--- Uppmätt mot drift 2026-08-27 av Nova, efter att migration 27 och 28 körts:
---   31 funktioner · 21 tabeller · 0 vyer · 54 RLS-policies i public · 4 fristående index
---   Repot beskrev 18 av 21 tabeller och 39 av 54 policies.
---   Index: inga glapp. Vyer: finns inte, varken i drift eller repo.
+-- ============================ KVITTO PÅ MÄTNINGEN ============================
+-- Allt nedan är uppmätt mot drift 2026-08-27, efter att migration 27 och 28 körts.
+-- Kör om frågorna och jämför — påstå ingenting härifrån utan att ha gjort det.
 --
--- Alla fyra tabellerna nedan är i SKARP DRIFT och innehåller data (mätt 2026-08-27):
---   pricing_settings 1 rad · billing_details 1 rad · extra_work_approvals 1 rad
---   consents 8 rader
--- Därför är varje sats skriven som "skapa om den saknas", aldrig som drop-and-recreate.
+--   select count(*) from pg_policies where schemaname='public';        -> 54
+--   select count(*) from pg_tables   where schemaname='public';        -> 21
 --
--- 🔴 VARFÖR DET SPELAR ROLL: byggs databasen om ur repot som det ser ut i dag (nytt
---   projekt, återställning efter haveri) saknas fem admin-policies, och då kan admin
---   inte skapa poster åt kund. Portalens adminflöden går sönder, tyst.
+-- 🔢 TABELLRÄKNINGEN, som version 1 fick fel (den påstod "18 av 21"):
+--   21 i drift · 16 beskrivna i repots supabase/*.sql (schema.sql inräknad)
+--   + 4 som den här filen skriver ned = 20
+--   + `applied_migrations`, som skapas av kor-migrationer.yml rad 100 i AGENT-repot,
+--     inte av någon migrationsfil = 21. Det går alltså ihop, men bara med den raden.
+--
+-- 🔒 RLS på de fyra tabellerna, uppmätt (pg_class.relrowsecurity):
+--   billing_details t · consents t · extra_work_approvals t · pricing_settings t
+--   relforcerowsecurity: false på alla fyra. `enable`-satserna är alltså no-ops i dag.
+--
+-- 🔁 TRIGGERS på de fyra: INGA (pg_trigger, tgisinternal = false -> tom).
+--   `updated_at` sätts av klienten (app.js rad 917 och 2178), inte av en trigger.
+--
+-- 🔑 FUNKTIONER (pg_proc, 2026-08-27):
+--   add_customer_spec_version(text,text,uuid)  md5 9ebea1d75d0296e050f4ecdd13180e3c
+--     proacl: =X postgres=X anon=X authenticated=X service_role=X   (PUBLIC har EXECUTE)
+--     ENARGUMENTSVERSIONEN FINNS INTE i drift — droppen i sektion 5 är alltså en no-op.
+--   oak_send_email(text,text,text)             md5 fc1d6c119bfcc48c03d7bdce8b391462
+--     proacl: postgres=X service_role=X        (INGET =X — PUBLIC är återkallad)
+--
+-- 📦 RADER i tabellerna: pricing_settings 1 · billing_details 1 · extra_work_approvals 1
+--   · consents 8. Alla fyra är i skarp drift; därför skapa-om-saknas, aldrig drop.
+--
+-- ⚠️ TABELL-GRANTS (relacl) är MÄTTA men återges INTE här. Alla fyra har Supabases
+--   standard (`anon`, `authenticated`, `service_role` med fulla tabellrättigheter, som
+--   RLS sedan begränsar). Det sätts av Supabases default privileges vid tabellskapande,
+--   inte av oss. **Jag har inte verifierat att en återuppbyggnad får samma default** —
+--   det är ett känt, oprövat antagande, inte ett påstående.
+--
+-- ============================ ÅTERUPPBYGGNADSVÄGEN ============================
+-- 🔴 `kor-migrationer.yml` globbar BARA `migration-*.sql`. **`schema.sql` körs aldrig av
+--   den.** Där ligger `profiles`, `requests`, `request_comments` och `is_admin()` — som
+--   den här filen är helt beroende av. `migration-1` och `migration-4` finns dessutom
+--   inte som filer alls (migration-3 rad 88 hänvisar till en "migration 4, körd
+--   2026-07-17"). En återuppbyggnad är alltså: schema.sql för hand FÖRST, sedan
+--   migrationerna i nummerordning. Det är inte en väg någon provat.
 --
 -- ⛔ VAD SOM INTE LIGGER HÄR — beteendeändringar hör hemma i migration 30:
---   * norm_host() strippar inte www i drift (dubbelt bakstreck i regexet)
---   * notify_email() saknar failed-grenen i repot
---   * policyn "extra-godk: kund hanterar egna" är FOR ALL, så en kund kan radera sitt
---     eget godkännande av extraarbete
---   Migration 27 blev underkänd två gånger för att den blandade "skriva ned" med
---   "ändra". Gör inte om det.
--- =================================================================================
+--   norm_host() (dubbelt bakstreck, strippar inte www) · notify_email() (saknar
+--   failed-grenen) · policyn "extra-godk: kund hanterar egna" (FOR ALL, så en kund kan
+--   radera sitt eget godkännande). Migration 27 blev underkänd två gånger för att den
+--   blandade "skriva ned" med "ändra". Gör inte om det.
+-- =============================================================================
+
+-- RÄTTAT (granskningsfynd 10): guarden i sektion 3 matchar policynamn med å, ä, ö byte
+-- för byte. Körs psql med annan client_encoding mangleras namnen, guarden missar, och
+-- filen skapar 15 dubblettpolicyer i produktion. En rad gör antagandet mätt.
+set client_encoding to 'UTF8';
+
+-- Fångar läget FÖRE. Sektion 6 jämför mot det och larmar om filen gjorde något.
+create temp table _f29_fore on commit drop as
+select
+  (select count(*) from pg_tables where schemaname = 'public'
+     and tablename in ('billing_details','extra_work_approvals','pricing_settings','consents')) as tabeller,
+  (select count(*) from information_schema.columns where table_schema = 'public'
+     and ((table_name = 'requests'             and column_name in ('change_items','change_note'))
+       or (table_name = 'onboarding_checkoffs' and column_name = 'with_extras'))) as kolumner,
+  (select count(*) from pg_policies where schemaname = 'public') as policies,
+  (select count(*) from public.pricing_settings) as prisrader;
 
 -- ---------------------------------------------------------------------------
 -- 1. Tabeller som ingen fil beskriver
 -- ---------------------------------------------------------------------------
--- ⚠️ RLS slås på EXPLICIT här. Lita inte på event-triggern ensure_rls: den finns i
--- drift men kan inte återskapas ur repot (kräver superuser — se migration 27). I en
--- återuppbyggnad finns den alltså inte, och då får dessa tabeller ingen RLS alls.
+-- ⚠️ RLS slås på EXPLICIT. Lita inte på event-triggern ensure_rls: den finns i drift men
+-- kan inte återskapas ur repot (kräver superuser — se migration 27). I en återuppbyggnad
+-- finns den alltså inte, och då får dessa tabeller ingen RLS alls.
 
 create table if not exists public.billing_details (
   user_id       uuid        not null references public.profiles(id) on delete cascade,
@@ -72,8 +122,8 @@ create table if not exists public.pricing_settings (
 alter table public.pricing_settings enable row level security;
 
 -- Portalen laser raden med .eq("id", 1).maybeSingle(). Utan raden far en aterbyggd
--- databas inga priser. Vardena nedan ar EXAKT de som star i drift 2026-08-27 och
--- identiska med kolumndefaulterna. I produktion ar satsen en no-op (raden finns).
+-- databas inga priser. Vardena ar EXAKT de i drift 2026-08-27 (3000/150/1095/1095) och
+-- identiska med kolumndefaulterna. I produktion ar satsen en no-op — raden finns.
 insert into public.pricing_settings (id) values (1) on conflict (id) do nothing;
 
 -- consents fanns bara BORTKOMMENTERAD i migration-3-stats.sql rad 90.
@@ -89,6 +139,10 @@ alter table public.consents enable row level security;
 -- ---------------------------------------------------------------------------
 -- 2. Kolumner som ingen fil beskriver
 -- ---------------------------------------------------------------------------
+-- RÄTTAT (granskningsfynd 2): `requests.change_note` saknades i version 1. app.js rad
+-- 2101 skriver change_note och change_items i SAMMA update-sats — jag skrev ned den ena
+-- och missade den andra. Uppmätt i drift 2026-08-27: text, nullable, ingen default.
+alter table public.requests             add column if not exists change_note  text;
 alter table public.requests             add column if not exists change_items jsonb;
 alter table public.onboarding_checkoffs add column if not exists with_extras  boolean;
 
@@ -98,10 +152,12 @@ alter table public.onboarding_checkoffs add column if not exists with_extras  bo
 -- Postgres har ingen "create policy if not exists", darfor DO-blocket. Villkoret ar
 -- policyns NAMN pa den tabellen — samma nyckel som pg_policies anvander.
 --
--- ⚠️ Ingen av dessa ror en BEFINTLIG policy. Skulle en policy med samma namn redan
--- finnas hoppas den over ororad, aven om dess villkor skiljer sig. Det ar avsiktligt:
--- att tyst skriva om ett RLS-villkor ar precis den sortens andring den har filen inte
--- ska gora. Avviker nagot upptacks det av verifieringen langst ner, inte av en drop.
+-- ⚠️ Ingen av dessa ror en BEFINTLIG policy. Skulle en policy med samma namn redan finnas
+-- hoppas den over ororad, aven om dess villkor skiljer sig. Det ar avsiktligt: att tyst
+-- skriva om ett RLS-villkor ar precis den sortens andring den har filen inte ska gora.
+-- Verifieringen i sektion 7 jamfor qual och with_check per policy — INTE antalet, som
+-- version 1 gjorde. En rakning kan per definition inte upptacka att en policy med ratt
+-- namn har fel villkor (granskningsfynd 7).
 
 do $$
 declare
@@ -131,7 +187,11 @@ begin
        where schemaname = 'public' and tablename = r.tabell and policyname = r.policynamn
     ) then
       execute format('create policy %I on public.%I %s', r.policynamn, r.tabell, r.villkor);
-      raise notice 'migration 29: skapade policy "%" pa %', r.policynamn, r.tabell;
+      -- RÄTTAT (granskningsfynd 1): var `raise notice`. En NOTICE syns bara som loggtext
+      -- och drunknar bland alla "already exists, skipping". kor-migrationer.yml lyfter
+      -- BARA WARNING till en annotering — och en ny permissiv policy i produktion får
+      -- inte passera tyst, särskilt inte när SHA-låset gör filen omöjlig att köra om.
+      raise warning 'migration 29 SKAPADE policy "%" pa %. Filen skulle vara en no-op mot produktion — kontrollera varfor den saknades.', r.policynamn, r.tabell;
     end if;
   end loop;
 end $$;
@@ -140,11 +200,16 @@ end $$;
 -- 4. Grants: PUBLIC EXECUTE pa e-postsandaren ar ATERKALLAD i drift
 -- ---------------------------------------------------------------------------
 -- 🔴 Ingen fil i repot aterkallar den. En ateruppbyggnad ur repot ger alltsa anon och
--- authenticated ratt att anropa oak_send_email direkt. Drift 2026-08-27:
---   proacl = postgres=X/postgres service_role=X/postgres   (inget =X, inget anon)
+-- authenticated ratt att anropa oak_send_email direkt.
 revoke execute on function public.oak_send_email(text, text, text) from public;
 revoke execute on function public.oak_send_email(text, text, text) from anon;
 revoke execute on function public.oak_send_email(text, text, text) from authenticated;
+-- RÄTTAT (granskningsfynd 4): version 1 hade bara de tre revoke:arna. I en
+-- återuppbyggnad skapas funktionen av migration-14 som postgres (proacl NULL = ägare +
+-- PUBLIC); efter revoke:arna blir den `postgres=X` UTAN `service_role=X`, alltså
+-- STRIKTARE än drift — på precis den rad som säger sig återge driftens ACL.
+-- Drift 2026-08-27: `postgres=X/postgres service_role=X/postgres`.
+grant execute on function public.oak_send_email(text, text, text) to service_role;
 
 -- ---------------------------------------------------------------------------
 -- 5. add_customer_spec_version — repot har FEL SIGNATUR
@@ -152,13 +217,37 @@ revoke execute on function public.oak_send_email(text, text, text) from authenti
 -- Drift har treargumentsversionen. Repot (migration-12 rad 30) definierar en
 -- ENARGUMENTSVERSION som inte finns i drift. app.js rad 1815 anropar treargumentsvarianten.
 --
--- 🔴 Varfor det inte racker att lagga till den ratta: treargumentsversionen har DEFAULT
--- pa argument 2 och 3, sa anropet add_customer_spec_version('x') traffar den. Ligger
--- BADA kvar i en aterbyggd databas blir det anropet TVETYDIGT och faller med fel.
--- Darfor slapps enargumentsversionen har. Matt 2026-08-27: den finns INTE i drift, sa
--- satsen ar en no-op i produktion. Den behovs bara i en ateruppbyggnad, dar migration-12
--- hinner skapa den forst.
+-- 🔴 Varfor det inte racker att lagga till den ratta: treargumentsversionen har DEFAULT pa
+-- argument 2 och 3. Ligger BADA kvar i en aterbyggd databas finns en tyst gammal kodvag
+-- som ignorerar p_scope och alltid skriver pa auth.uid() i stallet for
+-- coalesce(p_user, auth.uid()). Matt 2026-08-27: enargumentsversionen finns INTE i drift,
+-- sa droppen ar en no-op i produktion. Den behovs bara i en ateruppbyggnad, dar
+-- migration-12 hinner skapa den forst. DROP FUNCTION matchar pa exakt argumenttyplista,
+-- sa treargumentsversionen ar oatkomlig for satsen.
 drop function if exists public.add_customer_spec_version(text);
+
+-- RÄTTAT (granskningsfynd 5): `create or replace` nedan är villkorslös, och version 1 la
+-- kontrollen som ska bevisa att inget skrevs över UNDER rubriken "kör detta EFTER".
+-- Avviker transkriberingen på ett tecken är funktionen redan överskriven när md5:an
+-- avslöjar det, och originalet finns bara som en 32 tecken lång hash. Nu är kontrollen
+-- ett FÖRKRAV: avviker drift från det vi tror avbryts hela migrationen. Filen körs i EN
+-- transaktion (-1 i kor-migrationer.yml), så ett exception rullar tillbaka allt.
+do $$
+declare
+  v_md5 text;
+begin
+  select md5(pg_get_functiondef(p.oid)) into v_md5
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'public'
+     and p.oid::regprocedure::text = 'add_customer_spec_version(text,text,uuid)';
+
+  if v_md5 is null then
+    -- Finns inte: aterupbyggnad. Skapandet nedan ar da hela poangen.
+    raise warning 'migration 29: add_customer_spec_version(text,text,uuid) fanns inte — skapas nu. Vantat i en ateruppbyggnad, ALARMERANDE i produktion.';
+  elsif v_md5 <> '9ebea1d75d0296e050f4ecdd13180e3c' then
+    raise exception 'migration 29 AVBRYTER: add_customer_spec_version i drift har md5 % men filen ar skriven mot 9ebea1d75d0296e050f4ecdd13180e3c. Nagon har andrat funktionen sedan 2026-08-27. Kor INTE over den — las ut driftversionen med pg_get_functiondef, jamfor, och skriv en ny migration.', v_md5;
+  end if;
+end $$;
 
 -- Kroppen nedan ar Postgres EGEN rendering ur drift (pg_get_functiondef), inte avskriven
 -- for hand. md5 av den renderingen 2026-08-27: 9ebea1d75d0296e050f4ecdd13180e3c
@@ -232,25 +321,79 @@ begin
 end;
 $function$;
 
+-- Drift har PUBLIC EXECUTE (=X) pa funktionen, alltsa racker default vid nyskapande.
+-- Granten nedan aterger den explicita raden authenticated=X som ocksa star i drift.
 grant execute on function public.add_customer_spec_version(text, text, uuid) to authenticated;
 
 -- ---------------------------------------------------------------------------
--- VERIFIERING — kor detta EFTER migrationen
+-- 6. LARM OM FILEN INTE VAR EN NO-OP
 -- ---------------------------------------------------------------------------
--- 1. Att filen inte andrade nagot i drift. md5 fore = md5 efter:
+-- RÄTTAT (granskningsfynd 1). Hela filens löfte är att ingenting händer i produktion.
+-- Händer något ändå ska det INTE gå att missa: kor-migrationer.yml lyfter WARNING till
+-- en Actions-annotering, medan en NOTICE drunknar i loggtexten. Efter körningen är filen
+-- dessutom bokförd med SHA-lås och kan aldrig köras om — larmet är enda spåret.
+do $$
+declare
+  f  record;
+  nt int; nk int; np int; npr int;
+begin
+  select * into f from _f29_fore;
+  select count(*) into nt from pg_tables where schemaname = 'public'
+     and tablename in ('billing_details','extra_work_approvals','pricing_settings','consents');
+  select count(*) into nk from information_schema.columns where table_schema = 'public'
+     and ((table_name = 'requests'             and column_name in ('change_items','change_note'))
+       or (table_name = 'onboarding_checkoffs' and column_name = 'with_extras'));
+  select count(*) into np  from pg_policies where schemaname = 'public';
+  select count(*) into npr from public.pricing_settings;
+
+  if nt <> f.tabeller then
+    raise warning 'migration 29 SKAPADE % tabell(er) (% -> %). I produktion ska den siffran vara oforandrad.', nt - f.tabeller, f.tabeller, nt;
+  end if;
+  if nk <> f.kolumner then
+    raise warning 'migration 29 LADE TILL % kolumn(er) (% -> %). I produktion ska den siffran vara oforandrad.', nk - f.kolumner, f.kolumner, nk;
+  end if;
+  if np <> f.policies then
+    raise warning 'migration 29 SKAPADE % policy/policies (% -> %). I produktion ska den siffran vara oforandrad.', np - f.policies, f.policies, np;
+  end if;
+  if npr <> f.prisrader then
+    raise warning 'migration 29 SATTE IN prisraden (% -> %). I produktion ska den redan finnas.', f.prisrader, npr;
+  end if;
+  if nt = f.tabeller and nk = f.kolumner and np = f.policies and npr = f.prisrader then
+    raise notice 'migration 29: no-op bekraftad — inga tabeller, kolumner, policies eller rader tillkom.';
+  end if;
+end $$;
+
+-- ---------------------------------------------------------------------------
+-- 7. VERIFIERING — kor detta EFTER migrationen
+-- ---------------------------------------------------------------------------
+-- 1. Att funktionen inte skrevs over. Samma md5 som forkravet i sektion 5 kraver:
 --
 --   select md5(pg_get_functiondef(p.oid)) from pg_proc p
 --     join pg_namespace n on n.oid=p.pronamespace
 --    where n.nspname='public' and p.proname='add_customer_spec_version';
 --   -- ska ge 9ebea1d75d0296e050f4ecdd13180e3c
 --
--- 2. Att antalet policies ar oforandrat i produktion (54) — alla 15 fanns redan:
+-- 2. Att policyerna har ratt VILLKOR, inte bara ratt antal. En rakning kan inte upptacka
+--    att en policy med ratt namn har fel qual — det var granskningsfynd 7 mot version 1:
 --
---   select count(*) from pg_policies where schemaname='public';
+--   select tablename, policyname, cmd, roles::text, qual, with_check
+--     from pg_policies where schemaname='public'
+--      and (tablename in ('billing_details','extra_work_approvals','pricing_settings')
+--           or policyname in ('consents: öppen insert','acceptances: admin skapar',
+--               'checkoffs: admin bockar av','comments: admin skapar',
+--               'requests: admin skapar','proposals: admin agerar som kund'))
+--    order by tablename, policyname;
+--   -- jamfor rad for rad mot sektion 3. Villkoren ska vara identiska.
 --
--- 3. ⚠️ Anvand INTE `like 'migration-2[9]%'` for att kolla liggaren. Postgres LIKE
---    kanner bara % och _, sa en teckenklass matchar aldrig och fragan ar alltid tom.
+-- 3. Att grants ar oforandrade:
+--   select p.oid::regprocedure, array_to_string(p.proacl::text[],' ') from pg_proc p
+--     join pg_namespace n on n.oid=p.pronamespace where n.nspname='public'
+--    and p.proname in ('oak_send_email','add_customer_spec_version');
+--   -- oak_send_email ska ge: postgres=X/postgres service_role=X/postgres
+--
+-- 4. ⚠️ Anvand INTE `like 'migration-2[9]%'` for att kolla liggaren. Postgres LIKE kanner
+--    bara % och _, sa en teckenklass matchar aldrig och fragan ar alltid tom.
 --    Ratt form: `filnamn ~ '^migration-29-'`. Se studio/minne/kunskap-verifiering.md.
 --
--- 4. Ta med minst en rad du VET ska ge traff i varje kontrollfraga. Ett kontrollsteg
---    som ljuger blir brus, och da fangar det inte ett akta glapp heller.
+-- 5. Ta med minst en rad du VET ska ge traff i varje kontrollfraga. Ett kontrollsteg som
+--    ljuger blir brus, och da fangar det inte ett akta glapp heller.
