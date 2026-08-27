@@ -452,6 +452,10 @@ begin
   if f.prisrader >= 0 and npr <> f.prisrader then
     raise warning 'migration 29 SATTE IN prisraden (% -> %). I produktion ska den redan finnas.', f.prisrader, npr;
   end if;
+  -- ⚠️ `is not null` har (och `is null` i no-op-kvittot nedan) ar DEFENSIV SYMMETRI med
+  -- fn_md5, inte ett verkligt NULL-fall: `count(*)` over en filtrerad join ger alltid en
+  -- rad. Grinden ar alltsa inert. Den star kvar for att de fem jamforelserna ska se
+  -- likadana ut, men las den inte som att ett NULL-fall ar hanterat — det finns inget.
   if f.rls_pa is not null and nrls <> f.rls_pa then
     raise warning 'migration 29 SLOG PA RLS pa % tabell(er) (% -> % av 4). I produktion ska alla fyra redan ha RLS. Kontrollera att de har policies - en tabell med RLS men utan SELECT-policy ar tyst for API:t.', nrls - f.rls_pa, f.rls_pa, nrls;
   end if;
