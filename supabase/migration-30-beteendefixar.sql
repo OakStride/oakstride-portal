@@ -69,29 +69,47 @@ set client_encoding to 'UTF8';
 --   * två profiler vars websites skiljer sig bara på `www.` normaliseras till SAMMA värde
 --     och delar därmed statistikomfång.
 --
--- **Uppmätt kollisionsyta 2026-08-27, före körning:**
+-- **Uppmätt kollisionsyta 2026-08-27, ommätt oförändrad 2026-08-28, före körning:**
 --   profiler med `www.` i website ............................. 0
 --   kollisionsgrupper under GAMLA normaliseringen ............. 1  (två profiler, båda `oakstride.se`)
 --   kollisionsgrupper under NYA normaliseringen ............... 1  (samma två, samma värde)
 -- Kollisionen är alltså **pre-existerande och oförändrad av den här filen** — den beror på två
 -- identiska värden på vår egen domän, inte på www. **Fixen skapar ingen ny delning.**
 --
--- Taket för risken är dessutom begränsat: `protect_profile_cols` (migration-24 rad 33) sätter
--- `new.website := old.website` för alla utom admin, så en kund kan inte peka sin profil mot
--- någon annans domän. En kollision måste skapas av admin.
+-- Taket för risken är begränsat men inte absolut: `protect_profile_cols` (migration-24 rad 33)
+-- sätter `new.website := old.website` — men bara innanför `if auth.uid() is not null and not
+-- public.is_admin()`. **En inloggad kund** kan alltså inte peka sin profil mot någon annans
+-- domän. Varje skrivväg UTAN JWT — `service_role`, våra egna workflows och skript — kan
+-- fortfarande sätta `website` fritt. Formuleringen i v2 ("måste skapas av admin") var starkare
+-- än vad triggern ger. Därför bevakas kollisionen numera vid körning, inte bara i en mätning.
 --
 -- ✅ Beroenden kontrollerade mot katalogen, inte mot en handskriven lista (granskarens form):
 --     select pg_describe_object(classid, objid, objsubid), deptype from pg_depend
 --      where refclassid='pg_proc'::regclass
 --        and refobjid = to_regprocedure('public.norm_host(text)') and deptype <> 'i';
---   Utfall 2026-08-27: **noll rader.** Inget index, ingen generad kolumn, ingen constraint,
+--   Utfall 2026-08-27, ommätt 2026-08-28: **noll rader.** Inget index, ingen genererad kolumn,
+--   ingen constraint,
 --   ingen vy, ingen policy, ingen statistik och inget partitionsuttryck hänger på funktionen.
+--
+-- 🟡 **Axel 3, REFERRER — utskriven efter granskningen, den saknades i v2.**
+-- `normalize_page_view` (`migration-3-stats.sql` rad 35) nollar `referrer` när
+-- `norm_host(referrer) = new.site`. Efter fixen matchar `https://www.kund.se` mot `kund.se`,
+-- så ett besök som i dag bokförs som en **referral från den egna www-adressen** i stället
+-- räknas som ett internt klick och referrern kastas. Det är med all sannolikhet den avsedda
+-- semantiken — en länk från din egen www-adress *är* intern — men v2 gjorde anspråk på att
+-- vara uttömmande om vad som ändras, och nämnde den inte. En odeklarerad beteendeändring
+-- bredvid en deklarerad är exakt formen som fällde migration 27 två gånger.
 --
 -- ℹ️ `set search_path to 'public'` nedan är INTE en tredje ändring: **drift har den redan**
 --   (mätt med `pg_get_functiondef` 2026-08-27). Det är repots `migration-3-stats.sql` som
 --   saknar klausulen. Den nya definitionen återger alltså drift, inte repot, på den punkten.
 
 do $$
+declare
+  v_host   text;
+  v_gamla  int;
+  v_nya    int;
+  v_dep    int;
 begin
   if to_regprocedure('public.norm_host(text)') is null then
     raise exception 'migration 30 AVBRYTER: norm_host(text) finns inte i drift. Filen ar skriven mot en funktion som ska finnas - kontrollera vad som hant innan du kor om.';
@@ -100,12 +118,51 @@ begin
   -- Dyker en www-rad upp daremellan blir den kundens historik osynlig for site_stats, som
   -- efter fixen slar upp 'kund.se' medan raden lagrats som 'www.kund.se'. Tyst bortfall.
   if exists (select 1 from public.page_views where site like 'www.%') then
-    raise exception 'migration 30 AVBRYTER: page_views innehaller rader med www-prefix. Fixen skulle gora dem osynliga for site_stats. Normalisera dem forst, kor sedan om.';
+    raise exception 'migration 30 AVBRYTER: page_views innehaller rader med www-prefix. Fixen skulle gora dem osynliga for site_stats. Normalisera dem forst, kor sedan om. (Ja - detta stoppar aven andring 2, RLS-fixen, eftersom filen kors i EN transaktion. Ar det laget: normalisera raderna, annars dela filen.)';
   end if;
 
-  -- Beteendeprov: felet SKA finnas innan vi lagar det.
-  if public.norm_host('https://www.Example.com/nagot') <> 'www.example.com' then
-    raise exception 'migration 30 AVBRYTER: norm_host beter sig inte som uppmatt 2026-08-27. Vantat "www.example.com" (alltsa buggen), fick "%". Nagon har redan andrat funktionen - las den med pg_get_functiondef och avgor for hand om fixen fortfarande behovs.', public.norm_host('https://www.Example.com/nagot');
+  -- RATTAT (granskningsfynd mot v2): forra versionen satte en KORTIDSVAKT pa axel 1
+  -- (grupperingen, som filen sjalv kallar vilande) men lamnade axel 2 - AUKTORISERINGEN -
+  -- som en matning i en kommentar fran 2026-08-27. Fel axel bevakad. Satter mellan matning
+  -- och korning en admin en profils website till 'kund.se' och en annans till 'www.kund.se'
+  -- delar de tva profilerna statistikomfang efter fixen, och ingenting i filen marker det.
+  -- Nu berakas kollisionsgrupperna under BADA normaliseringarna vid korning.
+  select count(*) into v_gamla from (
+    select public.norm_host(website) h
+      from public.profiles
+     where website is not null and website <> ''
+     group by 1 having count(*) > 1) x;
+  select count(*) into v_nya from (
+    select regexp_replace(regexp_replace(lower(website), '^https?://', ''), '^www\.|/.*$', '', 'g') h
+      from public.profiles
+     where website is not null and website <> ''
+     group by 1 having count(*) > 1) y;
+  if v_nya > v_gamla then
+    raise exception 'migration 30 AVBRYTER: fixen skulle skapa nya kollisionsgrupper i profiles.website (% fore, % efter). Tva kunder skulle da dela statistikomfang i site_stats. Uppmatt 2026-08-27 var bada 1 och oforandrade. Gransk profilerna innan du kor om.', v_gamla, v_nya;
+  end if;
+
+  -- Samma sak for beroendematningen: den lag ocksa bara som kommentar. Ett index, en vy
+  -- eller en policy som skapats pa norm_host efter matningen skulle skrivas om under oss.
+  select count(*) into v_dep from pg_depend
+   where refclassid = 'pg_proc'::regclass
+     and refobjid = to_regprocedure('public.norm_host(text)')
+     and deptype <> 'i';
+  if v_dep > 0 then
+    raise exception 'migration 30 AVBRYTER: % objekt beror pa norm_host (index, vy, policy eller constraint). Uppmatt 2026-08-27: noll. En omdefiniering kan da andra deras innebord tyst - las pg_depend och avgor for hand.', v_dep;
+  end if;
+
+  -- Beteendeprov. RATTAT (granskningsfynd mot v2): forra formen avbrot om felet INTE fanns
+  -- - alltsa ocksa vid en ateruppbyggnad ur repot, dar migration-3-stats.sql skapar den
+  -- REDAN RATTA funktionen (ett bakstreck, kontrollerat byte for byte). Da fyrade forkravet
+  -- garanterat, `psql -1` rullade tillbaka, och `set -euo pipefail` i kor-migrationer.yml
+  -- stoppade migration 30 OCH varje senare fil. En vakt mot en glidning far inte gora repot
+  -- obyggbart - det ar precis vad migration 29 och kunskap-db-mot-repo.md finns for att
+  -- undvika. Nu accepteras BADA kanda formerna; bara en tredje avbryter.
+  v_host := public.norm_host('https://www.Example.com/nagot');
+  if v_host = 'example.com' then
+    raise notice 'migration 30: norm_host ar REDAN ratt (ger "example.com"). Andring 1 blir en no-op. Vantat i en ateruppbyggnad ur repot - ALARMERANDE i produktion, dar buggen var uppmatt 2026-08-27.';
+  elsif v_host <> 'www.example.com' then
+    raise exception 'migration 30 AVBRYTER: norm_host ger "%" - varken den uppmatta buggen ("www.example.com") eller det ratta svaret ("example.com"). Nagon har andrat funktionen at ett tredje hall. Las den med pg_get_functiondef och avgor for hand.', v_host;
   end if;
 end $$;
 
@@ -243,7 +300,10 @@ begin
     raise exception 'migration 30 AVBRYTER: vantade tva nya policyer pa extra_work_approvals, hittade %.', v_nya;
   end if;
 
-  raise warning 'migration 30 KLAR - tva beteendeandringar applicerade: norm_host strippar nu www, och kunden kan inte langre radera sitt eget godkannande av extraarbete. Bada ar AVSIKTLIGA andringar i drift.';
+  -- RATTAT (granskningsnotering mot v2): var `raise warning`. kor-migrationer.yml lyfter VARJE
+  -- warning till en ::warning::-annotering, just for att verkliga varningar annars forsvinner
+  -- bakom SHA-laset. En ren framgangsrapport i larmkanalen spader ut den signalen.
+  raise notice 'migration 30 KLAR - tva beteendeandringar applicerade: norm_host strippar nu www, och kunden kan inte langre radera sitt eget godkannande av extraarbete. Bada ar AVSIKTLIGA andringar i drift.';
 end $$;
 
 -- ---------------------------------------------------------------------------
