@@ -126,7 +126,7 @@ begin
   -- som en matning i en kommentar fran 2026-08-27. Fel axel bevakad. Satter mellan matning
   -- och korning en admin en profils website till 'kund.se' och en annans till 'www.kund.se'
   -- delar de tva profilerna statistikomfang efter fixen, och ingenting i filen marker det.
-  -- Nu berakas kollisionsgrupperna under BADA normaliseringarna vid korning.
+  -- Nu mats kollisionsytan under BADA normaliseringarna vid korning.
   -- RATTAT (granskningsfynd mot v3): forsta formen raknade ANTAL GRUPPER, och slapp
   -- darfor igenom en sammanslagning - just det utfall vakten finns for. Nya
   -- normaliseringen ar (strippa www) o (gamla), sa grupper kan bara sla ihop eller
