@@ -127,18 +127,21 @@ begin
   -- och korning en admin en profils website till 'kund.se' och en annans till 'www.kund.se'
   -- delar de tva profilerna statistikomfang efter fixen, och ingenting i filen marker det.
   -- Nu berakas kollisionsgrupperna under BADA normaliseringarna vid korning.
-  select count(*) into v_gamla from (
-    select public.norm_host(website) h
-      from public.profiles
-     where website is not null and website <> ''
-     group by 1 having count(*) > 1) x;
-  select count(*) into v_nya from (
-    select regexp_replace(regexp_replace(lower(website), '^https?://', ''), '^www\.|/.*$', '', 'g') h
-      from public.profiles
-     where website is not null and website <> ''
-     group by 1 having count(*) > 1) y;
+  -- RATTAT (granskningsfynd mot v3): forsta formen raknade ANTAL GRUPPER, och slapp
+  -- darfor igenom en sammanslagning - just det utfall vakten finns for. Nya
+  -- normaliseringen ar (strippa www) o (gamla), sa grupper kan bara sla ihop eller
+  -- tillkomma; en sammanslagning SANKER antalet grupper samtidigt som den skapar ny
+  -- delning. Motexempel: A och B har 'x.se' (grupp 1), C och D har 'www.x.se' (grupp 2)
+  -- -> gamla = 2. Efter fixen hamnar alla fyra pa 'x.se' -> nya = 1. `1 > 2` ar falskt,
+  -- vakten slapper igenom, och C och D delar nu statistikomfang med A och B.
+  -- Ratt matetal ar OVERSKOTTSRADER: rader minus distinkta varden. Pa samma exempel
+  -- ger det gamla 4-2 = 2 och nya 4-1 = 3, alltsa en okning, alltsa avbrott.
+  select count(*) - count(distinct public.norm_host(website)) into v_gamla
+    from public.profiles where website is not null and website <> '';
+  select count(*) - count(distinct regexp_replace(regexp_replace(lower(website), '^https?://', ''), '^www\.|/.*$', '', 'g')) into v_nya
+    from public.profiles where website is not null and website <> '';
   if v_nya > v_gamla then
-    raise exception 'migration 30 AVBRYTER: fixen skulle skapa nya kollisionsgrupper i profiles.website (% fore, % efter). Tva kunder skulle da dela statistikomfang i site_stats. Uppmatt 2026-08-27 var bada 1 och oforandrade. Gransk profilerna innan du kor om.', v_gamla, v_nya;
+    raise exception 'migration 30 AVBRYTER: fixen skulle lata fler profiler dela samma normaliserade varde i profiles.website (overskottsrader % fore, % efter). De skulle da dela statistikomfang i site_stats. Uppmatt 2026-08-28: bada 1 (fyra profiler, tva med identiskt varde pa var egen doman - en pre-existerande delning som fixen varken skapar eller vidgar). Gransk profilerna innan du kor om.', v_gamla, v_nya;
   end if;
 
   -- Samma sak for beroendematningen: den lag ocksa bara som kommentar. Ett index, en vy
@@ -160,7 +163,13 @@ begin
   -- undvika. Nu accepteras BADA kanda formerna; bara en tredje avbryter.
   v_host := public.norm_host('https://www.Example.com/nagot');
   if v_host = 'example.com' then
-    raise notice 'migration 30: norm_host ar REDAN ratt (ger "example.com"). Andring 1 blir en no-op. Vantat i en ateruppbyggnad ur repot - ALARMERANDE i produktion, dar buggen var uppmatt 2026-08-27.';
+    -- RATTAT (granskningsfynd mot v3): var `raise notice`. kor-migrationer.yml rad 66
+    -- lyfter BARA rader som matchar '^(psql:...: )?WARNING:' till en ::warning::-annotering.
+    -- En notice blir loggtext i ett gront jobb - och direkt efterat bokfors filen och
+    -- SHA-laset gor att den aldrig kors om. Larmet hade alltsa aldrig natt nagon, i exakt
+    -- det scenario det beskriver. Migration 29 gjorde samma rattelse av samma skal.
+    -- Framgangsrapporten langst ned ska daremot FORBLI notice: warning ar larmkanalen.
+    raise warning 'migration 30: norm_host ar REDAN ratt (ger "example.com"). Andring 1 blir en no-op. Vantat i en ateruppbyggnad ur repot - ALARMERANDE i produktion, dar buggen var uppmatt 2026-08-27.';
   elsif v_host <> 'www.example.com' then
     raise exception 'migration 30 AVBRYTER: norm_host ger "%" - varken den uppmatta buggen ("www.example.com") eller det ratta svaret ("example.com"). Nagon har andrat funktionen at ett tredje hall. Las den med pg_get_functiondef och avgor for hand.', v_host;
   end if;
