@@ -55,7 +55,7 @@
 --     drift : "...Nytt betongpannetak pa 180 m2"
 --
 -- Uppmatt i drift 2026-09-06: driften har den KORTA texten, alltsa den som star
--- i den har filen. Det ar allts inte ett avskrivningsfel utan ETT NYTT GLAPP at
+-- i den har filen. Det ar alltsa inte ett avskrivningsfel utan ETT NYTT GLAPP at
 -- andra hallet - kitet uppdaterades efter att raden seedades, och tabellen foljde
 -- inte med. Filen dokumenterar drift korrekt; den loser inte den skillnaden.
 --
@@ -89,7 +89,9 @@ begin
     into v_antal, v_md5
     from public.site_templates;
 
-  perform set_config('migration33.md5_fore', coalesce(v_md5, '(tom tabell)'), false);
+  -- Bara `lage` sparas. En tidigare version sparade ocksa md5:t och laste det
+  -- aldrig efter att slutnoticen borjade ga pa lagesflaggan - en GUC som skrivs
+  -- utan att lasas far nasta lasare att tro att den bar nagot.
 
   -- 🔴 RATTAT efter granskning. Forsta versionen hade TVA lagen: "stammer" och
   -- "stammer inte", dar det andra bara varnade och sedan skrev over. Effekten var
@@ -105,7 +107,20 @@ begin
 
   elsif v_md5 = '4387f70c7e7e10a285be70da5e6d9e14' then
     -- Exakt vad migration-20 ENSAM lamnar efter sig: tre rader, gamla etiketter.
-    -- Uppmatt 2026-09-06 genom att kora migration-20:s seed i en CTE.
+    -- Uppmatt 2026-09-06 genom att kora migration-20:s seed i en CTE, och
+    -- oberoende omraknat av granskaren direkt ur migration-20:s text.
+    --
+    -- ⚠️ DEN HAR GRENEN BAR ETT VILLKOR SOM INTE SYNS: **ingen migration med
+    -- lagre nummer far rora site_templates.** Gor nagon det andras tabellens
+    -- innehall fore 33, md5:t stammer inte, och en akta ateruppbyggnad hamnar i
+    -- avbrottsgrenen nedan i stallet. Uppmatt 2026-09-06: noll traffar pa
+    -- `site_templates` i migration 21-30 (main), 31 (grenen) och 32 (PR #64) -
+    -- men 31 och 32 ar omergade och kan andras. Ror du en lagre numrerad
+    -- migration: rakna om det har md5:t.
+    --
+    -- Notera ocksa vad konstanten vilar pa: migration-20:s insert anger INTE
+    -- `active`, utan later kolumnens `default true` galla. Andras defaulten blir
+    -- konstanten fel.
     perform set_config('migration33.lage', 'ateruppbyggnad', false);
     raise warning 'migration 33: tabellen innehaller exakt migration-20:s tre rader. Det ar en ATERUPPBYGGNAD ur repot - filen fyller pa till driftens fem.';
 
@@ -165,6 +180,14 @@ begin
 
   -- Sag vilket lage det VAR, hamtat ur forkontrollens matning - gissa inte ur
   -- md5:n efterat, for da ser bada lagen likadana ut.
+  --
+  -- ⚠️ Lagesflaggan ar en SESSIONSNIVA-GUC, sa de bada blocken maste kora i samma
+  -- session. Pa korarens vag (`psql -1 -f`) ar hela filen en transaktion och
+  -- darmed garanterat samma backend. Kors filen for hand sats for sats mot en
+  -- TRANSACTION POOLER (port 6543) kan blocken landa pa olika backends, och da
+  -- fyrar exceptionen nedan falskt EFTER att insert:en committats. Skadan ar
+  -- noll - filen ar idempotent och en omkorning ger `lage='drift'` och gront -
+  -- men kor helst hela filen i ett svep, mot session pooler eller direkt.
   v_fore := current_setting('migration33.lage', true);
   if v_fore = 'drift' then
     raise notice 'migration 33 KLAR - no-op bekraftad: innehallet var redan driftens och ar oforandrat.';
