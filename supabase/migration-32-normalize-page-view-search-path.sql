@@ -262,7 +262,7 @@ begin
   else
     -- 🔴 ATERUPPBYGGNAD - och har lag anstrangningen fel fordelad mot risken.
     -- Kroppen SKA ha andrats (repots version bar en kommentarrad som driftens
-    -- saknar), sa krav 2 galler inte. Men en tidigare version krävde da INGENTING
+    -- saknar), sa krav 2 galler inte. Men en tidigare version kravde da INGENTING
     -- alls om resultatet: krav 1 sa bara att klausulen fanns, och slutraden skrev
     -- ut en md5 utan att jamfora den. Alltsa hade den gren som ar hela filens
     -- SYFTE - och den enda som ar oprovad - filens svagaste krav.
@@ -275,9 +275,9 @@ begin
     --
     -- Detta krav KAN ga rott: en CRLF-utcheckning eller en redigerad kropp fyrar det.
     if v_kropp_md5 is distinct from 'b4786aafa5a1f95a9f5c3dd31b911ae6' then
-      raise exception 'migration 32 AVBRYTER: ateruppbyggnaden gav en kropp med md5 % - vantat b4786aafa5a1f95a9f5c3dd31b911ae6 (driftens, 184 tecken, uppmatt 2026-09-05). 👉 Kontrollera FORST radsluten: fran en Windows-utcheckning med core.autocrlf=true hamnar CR i kroppen och md5 avviker utan att nagot verkligt skiljer.', coalesce(v_kropp_md5, '(kunde inte lasas)');
+      raise exception 'migration 32 AVBRYTER: ateruppbyggnaden gav en kropp med md5 % - vantat b4786aafa5a1f95a9f5c3dd31b911ae6 (driftens UPPMATTA md5 fran 2026-09-05, 184 tecken). 👉 Kontrollera FORST radsluten: fran en Windows-utcheckning med core.autocrlf=true hamnar CR i kroppen och md5 avviker utan att nagot verkligt skiljer.', coalesce(v_kropp_md5, '(kunde inte lasas)');
     end if;
-    raise notice 'migration 32 KLAR - laget var ATERUPPBYGGNAD. No-op-kravet HOPPADES OVER med flit (kroppen ska andras har), men kroppen kontrollerades mot driftens md5 och stamde. Definitionen gick fran % till %.', v_def_fore, v_def_efter;
+    raise notice 'migration 32 KLAR - laget var ATERUPPBYGGNAD. No-op-kravet HOPPADES OVER med flit (kroppen ska andras har), men kroppen kontrollerades mot driftens uppmatta md5 fran 2026-09-05 och stamde. Definitionen gick fran % till %.', v_def_fore, v_def_efter;
   end if;
 end $$;
 
