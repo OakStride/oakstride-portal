@@ -73,21 +73,39 @@
 -- filens SQL. Det ar samma sort som issue #24 handlar om: ett prov kan ga gront
 -- utan att ha provat nagot.
 --
--- Vad som verkligen ar provat, 2026-09-05 mot drift:
---   1. Bada `do $$`-blocken kordes skarpt med `create or replace` UTELAMNAD -
---      de laser bara pg_catalog och satter sessions-GUC:er, sa ingenting andrades.
---      I driftlaget ar create-or-replace anda en no-op, sa provet tacker HELA
---      driftvagen. Utfall: laget mattes till `drift`, krav 2 kordes och holl.
---   2. GUC:erna overlevde mellan de tva blocken i samma session - forutsattningen
+-- 🔴 OCH JAG GICK PA DET SJALV, I DEN HAR FILEN. Forsta provet korde bada
+-- `do $$`-blocken men UTELAMNADE `create or replace` - den enda sats som andrar
+-- nagot - och motiverade utelamnandet med att den anda ar en no-op i drift,
+-- alltsa med den slutsats efterkontrollen finns for att BEVISA. Foljden var
+-- matbar: utan create:n ror ingenting `pg_proc` mellan de tva lasningarna, sa
+-- `v_def_fore = v_def_efter` var sant GENOM KONSTRUKTION. Raden "krav 2 kordes
+-- och holl" var ett gront utfall som inte kunde ga rott - exakt det filen tva
+-- stycken hogre upp anklagar `dry_run` for. Granskaren fangade det.
+--
+-- Vad som ar provat pa riktigt, 2026-09-05 mot drift:
+--   1. HELA filen, `create or replace` inkluderad, kord inuti
+--      `begin; ... rollback;`. Bada blocken och sjalva satsen utovades; allt
+--      kastades. Inget undantag. Efter rollback ar driften oforandrad -
+--      kontrollerat i en NY sats: md5 33609944fe0aae8390c66bc6a42b6457,
+--      proconfig search_path=public.
+--      Det gar for driftvagen just for att filen anda kors i en transaktion.
+--   2. Rollback-mekanismen sjalv provad separat innan, sa provet inte vilar pa
+--      att den antas fungera.
+--   3. GUC:erna overlever mellan de tva blocken i samma session - forutsattningen
 --      krav 2 vilar pa, matt i stallet for antagen.
---   3. Beslutslogikens FEM grenar provade var for sig pa pahittade varden:
+--   4. Beslutslogikens FEM grenar provade var for sig pa pahittade varden:
 --      klausul finns · klausul pekar fel · ateruppbyggnad · okand kropp ·
 --      klausul plus ett extra proconfig-element. Alla fem gav ratt utfall.
 --      (PR #47:s lardom: felet satt i den ovanliga grenen, inte den vanliga.)
+--   5. Oberoende av provet: granskaren raknade fram den kanoniska
+--      `pg_get_functiondef`-strangen ur filens EGEN text och fick 328 tecken,
+--      md5 33609944fe0aae8390c66bc6a42b6457 - identiskt med driftens. No-op-
+--      ligheten ar alltsa visad genom konstruktion, inte bara genom korningen.
 --
--- Vad som INTE ar provat: sjalva `create or replace` mot en databas som saknar
--- klausulen - alltsa ateruppbyggnadsvagen. Den kraver ett tomt schema, och det
--- ar issue #61.
+-- Vad som INTE ar provat: `create or replace` mot en databas som SAKNAR
+-- klausulen - alltsa ateruppbyggnadsvagen. Den kraver ett tomt schema (issue
+-- #61). Darfor har den grenen nu ett eget, provbart krav pa kroppens md5 langst
+-- ned - den var tidigare filens svagaste, trots att den ar dess syfte.
 
 set client_encoding to 'UTF8';
 
@@ -133,8 +151,10 @@ begin
     raise warning 'migration 32: det finns % varianter av normalize_page_view. Filen ror bara noll-argumentvarianten - kontrollera att det ar avsiktligt.', v_antal;
   end if;
 
+  -- Bara def_fore och lage sparas. En tidigare version sparade ocksa `cfg_fore`
+  -- och laste den aldrig - en GUC som skrivs utan att lasas far nasta lasare att
+  -- tro att proconfig jamfors fore/efter, vilket den inte gor. Krav 1 tacker det.
   perform set_config('migration32.def_fore', v_def_md5, false);
-  perform set_config('migration32.cfg_fore', v_cfg, false);
 
   if v_cfg = 'search_path=public' then
     -- Vantat lage i produktion.
@@ -187,17 +207,36 @@ declare
   v_oid oid;
   v_def_efter text;
   v_cfg text;
+  v_kropp_md5 text;
   v_def_fore text;
   v_lage text;
 begin
+  -- 🔴 Samma is-null-vakt som forkravet har. Utan den fanns NULL-tystnaden kvar
+  -- i just det block som stanger den lite langre ned: forsvann funktionen skulle
+  -- `select` ge noll rader, alla jamforelser bli NULL - alltsa varken sant eller
+  -- falskt - och filen skriva "kravet KORDES och holl (md5 <NULL>)". Ett falskt
+  -- nej i stallet for en bedomning. Onaobart pa korarens vag, dar `create or
+  -- replace` just kort i samma transaktion, men det ar samma klass som raderna
+  -- nedan uttryckligen kallar oacceptabel.
   v_oid := to_regprocedure('public.normalize_page_view()');
-  select md5(pg_get_functiondef(p.oid)), coalesce(array_to_string(p.proconfig, ','), '')
-    into v_def_efter, v_cfg
+  if v_oid is null then
+    raise exception 'migration 32 AVBRYTER: normalize_page_view() finns inte EFTER korningen. Definitionen tog inte, eller nagot tog bort den mitt i.';
+  end if;
+
+  select md5(pg_get_functiondef(p.oid)), coalesce(array_to_string(p.proconfig, ','), ''),
+         md5(p.prosrc)
+    into v_def_efter, v_cfg, v_kropp_md5
     from pg_proc p
    where p.oid = v_oid;
 
+  if v_def_efter is null then
+    raise exception 'migration 32 AVBRYTER: kunde inte lasa funktionsdefinitionen efter korningen. Ingen slutsats gar att dra - och en olast rad far aldrig rapporteras som ett godkant varde.';
+  end if;
+
   -- Krav 1: klausulen ska finnas. Last ur pg_catalog, inte ur filens egen text.
-  if v_cfg <> 'search_path=public' then
+  -- `is distinct from`, inte `<>`: med NULL ger `<>` varken sant eller falskt och
+  -- villkoret fyrar inte alls.
+  if v_cfg is distinct from 'search_path=public' then
     raise exception 'migration 32 AVBRYTER: proconfig ar "%" och inte "search_path=public" efter korningen. Definitionen tog inte.', coalesce(nullif(v_cfg, ''), '(tom)');
   end if;
 
@@ -215,17 +254,30 @@ begin
   if v_lage = 'drift' then
     -- Har ska definitionen vara BYTE-IDENTISK. Det ar det enda som gor
     -- no-op-pastaendet provbart - utan det ar det bara ett pastaende.
-    if v_def_fore <> v_def_efter then
+    if v_def_fore is distinct from v_def_efter then
       raise exception 'migration 32 AVBRYTER: funktionsdefinitionen ANDRADES i drift (md5 % -> %). 👉 Kontrollera FORST radsluten: kors filen fran en Windows-utcheckning med core.autocrlf=true hamnar CR i kroppen och md5 avviker utan att nagot verkligt skiljer. Stammer radsluten har driftens definition glidit fran den har filens - las ut den med pg_get_functiondef och avgor for hand.', v_def_fore, v_def_efter;
     end if;
     raise notice 'migration 32 KLAR - no-op-kravet KORDES och holl: definitionen ar byte-identisk (md5 %).', v_def_efter;
 
   else
-    -- Ateruppbyggnad: kroppen SKA ha andrats (repots version bar en kommentarrad
-    -- som driftens saknar), sa krav 2 galler inte. Slutraden maste saga att det
-    -- HOPPADES OVER - annars kan den som laser loggen under en katastrofater-
-    -- stallning inte skilja "kontrollerat och oforandrat" fran "aldrig kontrollerat".
-    raise notice 'migration 32 KLAR - laget var ATERUPPBYGGNAD, sa no-op-kravet HOPPADES OVER med flit. Definitionen andrades fran md5 % till %, vilket ar meningen har.', v_def_fore, v_def_efter;
+    -- 🔴 ATERUPPBYGGNAD - och har lag anstrangningen fel fordelad mot risken.
+    -- Kroppen SKA ha andrats (repots version bar en kommentarrad som driftens
+    -- saknar), sa krav 2 galler inte. Men en tidigare version krävde da INGENTING
+    -- alls om resultatet: krav 1 sa bara att klausulen fanns, och slutraden skrev
+    -- ut en md5 utan att jamfora den. Alltsa hade den gren som ar hela filens
+    -- SYFTE - och den enda som ar oprovad - filens svagaste krav.
+    --
+    -- Nu kravs att kroppen blev EXAKT driftens. Jamforelsen gors pa `prosrc` och
+    -- inte pa `pg_get_functiondef`, med flit: prosrc lagras ordagrant som den
+    -- skrevs, medan functiondef kanoniseras av servern och darfor kan formateras
+    -- om mellan Postgres-versioner. Ett krav som gar sonder vid en versionshojning
+    -- ar ett krav nagon river ut.
+    --
+    -- Detta krav KAN ga rott: en CRLF-utcheckning eller en redigerad kropp fyrar det.
+    if v_kropp_md5 is distinct from 'b4786aafa5a1f95a9f5c3dd31b911ae6' then
+      raise exception 'migration 32 AVBRYTER: ateruppbyggnaden gav en kropp med md5 % - vantat b4786aafa5a1f95a9f5c3dd31b911ae6 (driftens, 184 tecken, uppmatt 2026-09-05). 👉 Kontrollera FORST radsluten: fran en Windows-utcheckning med core.autocrlf=true hamnar CR i kroppen och md5 avviker utan att nagot verkligt skiljer.', coalesce(v_kropp_md5, '(kunde inte lasas)');
+    end if;
+    raise notice 'migration 32 KLAR - laget var ATERUPPBYGGNAD. No-op-kravet HOPPADES OVER med flit (kroppen ska andras har), men kroppen kontrollerades mot driftens md5 och stamde. Definitionen gick fran % till %.', v_def_fore, v_def_efter;
   end if;
 end $$;
 
