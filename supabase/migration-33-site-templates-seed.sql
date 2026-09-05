@@ -47,6 +47,22 @@
 -- utdata sager "Grundmall: Restaurang & Cafe (meny + bordsbokning)", alltsa
 -- driftens formulering och inte repots. Repot ar efter, inte fore.
 --
+-- ⚠️ MEN INTE HELT. En granskare jamforde alla fem raderna falt for falt mot
+-- kitets mallregister: **26 av 27 falt matchar ordagrant, ett gor det inte.**
+--
+--   hantverk.extra_fields[0].hint
+--     kit   : "...Nytt betongpannetak pa 180 m2 med ny lakt"
+--     drift : "...Nytt betongpannetak pa 180 m2"
+--
+-- Uppmatt i drift 2026-09-06: driften har den KORTA texten, alltsa den som star
+-- i den har filen. Det ar allts inte ett avskrivningsfel utan ETT NYTT GLAPP at
+-- andra hallet - kitet uppdaterades efter att raden seedades, och tabellen foljde
+-- inte med. Filen dokumenterar drift korrekt; den loser inte den skillnaden.
+--
+-- 👉 Att stalla dem mot varandra hor hemma i issue #60, inte har. Den som gor det
+-- ska veta att kitets text bara ar en LEDTRAD i portalens dropdown - den styr
+-- ingenting i bygget - sa avvikelsen ar kosmetisk och inte bradskande.
+--
 -- Uppmatt 2026-09-06: 5 rader, innehalls-md5 60de30e057011cc72317c756462ec443.
 -- VARDENA NEDAN AR FORMATERADE AV DATABASEN sjalv med `format('%L', ...)`, inte
 -- avskrivna for hand - avskrift av fem rader svensk prosa och inbaddad JSON ar
@@ -75,12 +91,26 @@ begin
 
   perform set_config('migration33.md5_fore', coalesce(v_md5, '(tom tabell)'), false);
 
+  -- 🔴 RATTAT efter granskning. Forsta versionen hade TVA lagen: "stammer" och
+  -- "stammer inte", dar det andra bara varnade och sedan skrev over. Effekten var
+  -- att en AVSIKTLIG andring i drift - t.ex. att nagon inaktiverat en malltyp -
+  -- tyst backades av den har filen, med gron korning och bokforing i liggaren.
+  -- Efterkontrollen kunde inte fanga det, eftersom upserten just gjort dess
+  -- konstant sann. En kontroll som atgarden sjalv uppfyller ar ingen kontroll.
+  --
+  -- De tva LEGITIMA lagen ar atskiljbara, sa de skiljs at. Allt annat avbryter.
   if v_md5 = '60de30e057011cc72317c756462ec443' then
+    perform set_config('migration33.lage', 'drift', false);
     raise notice 'migration 33: innehallet ar redan driftens (5 rader, md5 stammer). Filen ar en no-op - vantat i produktion.';
+
+  elsif v_md5 = '4387f70c7e7e10a285be70da5e6d9e14' then
+    -- Exakt vad migration-20 ENSAM lamnar efter sig: tre rader, gamla etiketter.
+    -- Uppmatt 2026-09-06 genom att kora migration-20:s seed i en CTE.
+    perform set_config('migration33.lage', 'ateruppbyggnad', false);
+    raise warning 'migration 33: tabellen innehaller exakt migration-20:s tre rader. Det ar en ATERUPPBYGGNAD ur repot - filen fyller pa till driftens fem.';
+
   else
-    -- WARNING och inte notice: vid en ateruppbyggnad ar det har normalt, men i
-    -- PRODUKTION betyder det att nagon andrat mallistan sedan matningen.
-    raise warning 'migration 33: innehallet skiljer sig fran matningen 2026-09-06 (% rader, md5 %). Vantat vid en ateruppbyggnad. Ser du det i produktion har nagon andrat mallistan - kontrollera att overskrivningen nedan ar onskad.', v_antal, coalesce(v_md5, '(tom)');
+    raise exception 'migration 33 AVBRYTER: innehallet ar varken driftens (md5 60de30e057011cc72317c756462ec443, 5 rader) eller migration-20:s (md5 4387f70c7e7e10a285be70da5e6d9e14, 3 rader). Uppmatt nu: % rader, md5 %. Nagon har ANDRAT mallistan sedan 2026-09-06 - kanske inaktiverat en malltyp eller lagt till en. Filen skulle backa den andringen tyst och sedan bokforas som lyckad. Mat om vad som galler och skriv en NY migration; andra inte den har.', v_antal, coalesce(v_md5, '(tom tabell)');
   end if;
 end $$;
 
@@ -133,11 +163,15 @@ begin
     raise exception 'migration 33 AVBRYTER: innehalls-md5 ar % efter korningen, vantat 60de30e057011cc72317c756462ec443 (uppmatt i drift 2026-09-06). Nagon rad skiljer sig - jamfor key, label, description, sort, extra_fields och active mot filen ovan.', coalesce(v_md5, '(tom)');
   end if;
 
-  v_fore := current_setting('migration33.md5_fore', true);
-  if v_fore = '60de30e057011cc72317c756462ec443' then
+  -- Sag vilket lage det VAR, hamtat ur forkontrollens matning - gissa inte ur
+  -- md5:n efterat, for da ser bada lagen likadana ut.
+  v_fore := current_setting('migration33.lage', true);
+  if v_fore = 'drift' then
     raise notice 'migration 33 KLAR - no-op bekraftad: innehallet var redan driftens och ar oforandrat.';
+  elsif v_fore = 'ateruppbyggnad' then
+    raise notice 'migration 33 KLAR - ateruppbyggnad: tabellen gick fran migration-20:s tre rader till driftens fem.';
   else
-    raise notice 'migration 33 KLAR - tabellen fylldes till driftens innehall (md5 % -> %). Det ar meningen vid en ateruppbyggnad.', coalesce(v_fore, '(okant)'), v_md5;
+    raise exception 'migration 33 AVBRYTER: forkontrollens lage saknas, alltsa har det blocket inte kort i den har sessionen. Kor HELA filen i ett svep.';
   end if;
 end $$;
 
