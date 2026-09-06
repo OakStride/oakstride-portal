@@ -1003,12 +1003,34 @@
         // en null-vakt, och approveOffer kraver anda ifyllda falt.
         var tomFaktura = !bill.company && !bill.org_nr && !bill.address &&
                          !bill.postal_city && !bill.invoice_email && !bill.reference;
-        var skrivningar = [sb.from("profiles").update({ full_name: newName, company: newCompany }).eq("id", session.user.id)];
+        // `.select("id")` sa vi far tillbaka de rader som FAKTISKT skrevs. Utan den
+        // kan vi bara se om anropet felade - och en USING-filtrerad update felar inte,
+        // den traffar noll rader. Se raknningen i .then() nedan.
+        var skrivningar = [sb.from("profiles").update({ full_name: newName, company: newCompany }).eq("id", session.user.id).select("id")];
         if (hadeRad || !tomFaktura) skrivningar.push(sb.from("billing_details").upsert(bill));
 
         Promise.all(skrivningar).then(function (rs) {
           var err = (rs[0] && rs[0].error) || (rs[1] && rs[1].error);
           if (err) { note.hidden = false; note.className = "status-note error"; note.textContent = "Kunde inte spara: " + err.message; return; }
+
+          // 🔴 RATTAT 2026-09-06 efter granskning. Har stod tidigare bara felkollen
+          // ovan, och sedan "Uppgifterna ar sparade".
+          //
+          // Uppmatt i drift: en update som RLS filtrerar bort traffar **0 rader och
+          // ger inget fel**. Kunden fick alltsa ett gront kvitto for en sparning som
+          // aldrig skedde. Sparren ovan gjorde det VARRE: utan den avvisades
+          // upserten med 42501 (`with check`) och kunden fick atminstone ett rott
+          // felmeddelande. Med sparren hoppades den over, och da fanns ingenting
+          // kvar som kunde fela.
+          //
+          // Nu raknas raderna i stallet. Noll rader betyder att ingenting andrades,
+          // aldrig att det gick bra - globala principernas regel, rakt av.
+          var skrivna = (rs[0] && rs[0].data) ? rs[0].data.length : 0;
+          if (!skrivna) {
+            note.hidden = false; note.className = "status-note error";
+            note.textContent = "Ingenting sparades — din inloggning verkar inte längre gälla. Logga ut och in igen, så försvinner inget av det du fyllt i här.";
+            return;
+          }
           profile.full_name = newName; profile.company = newCompany;
           if (newEmail && newEmail !== profile.email) {
             sb.auth.updateUser({ email: newEmail }).then(function (er) {
