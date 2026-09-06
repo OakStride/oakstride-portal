@@ -886,7 +886,33 @@
     show("app");
     main.innerHTML = '<div class="spinner"></div>';
     sb.from("billing_details").select("*").eq("user_id", session.user.id).maybeSingle().then(function (res) {
-      var b = (res && res.data) ? res.data : {};
+      // 🔴 RATTAT 2026-09-06 (tystnadssvep). `res.error` lastes aldrig har.
+      //
+      // Misslyckades hamtningen blev `b = {}` och formuläret renderades TOMT -
+      // identiskt med "kunden har aldrig fyllt i nagot". Sparade kunden da, for
+      // att byta sitt telefonnummer, skrevs org.nr, fakturaadress och fakturamejl
+      // over med null. Tyst forlust av det vi fakturerar pa.
+      //
+      // ⚠️ Det som gor felet svart att se: `maybeSingle()` ger `data = null,
+      // error = null` for en kund UTAN rad. Ett tomt formular ar alltsa helt
+      // riktigt for en ny kund. Det ENDA som skiljer lagena at ar `error`.
+      //
+      // Fixen ar inte att validera vid submit - en kund ska kunna tomma ett falt.
+      // Fixen ar att aldrig visa ett formular byggt pa data vi inte fick.
+      if (res && res.error) {
+        main.innerHTML =
+          '<button class="back-link" id="btn-acc-back">&larr; Tillbaka</button>' +
+          '<div class="card" style="max-width:600px"><h1>Mina uppgifter</h1>' +
+          '<p class="status-note error">Dina uppgifter kunde inte hamtas just nu: ' + esc(res.error.message) + '</p>' +
+          '<p class="muted">Formuläret visas inte, eftersom ett tomt formulär hade kunnat spara över dina faktureringsuppgifter. Ladda om sidan och försök igen — ingenting har ändrats.</p>' +
+          '<button class="btn btn-primary btn-inline" id="btn-acc-retry">Försök igen</button></div>';
+        document.getElementById("btn-acc-back").addEventListener("click", function () {
+          if (profile.is_admin && !viewAsCustomer) renderAdmin(); else renderCustomer();
+        });
+        document.getElementById("btn-acc-retry").addEventListener("click", renderAccount);
+        return;
+      }
+      var b = res.data || {};
       function f(id, label, val, ph, type) { return '<label for="' + id + '">' + esc(label) + '</label><input type="' + (type || "text") + '" id="' + id + '" value="' + esc(val || "") + '"' + (ph ? ' placeholder="' + esc(ph) + '"' : "") + ">"; }
       main.innerHTML =
         '<button class="back-link" id="btn-acc-back">&larr; Tillbaka</button>' +
