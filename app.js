@@ -901,10 +901,18 @@
       // den har kommentaren pastod att "det ENDA som skiljer lagena at ar error".
       // Det ar FALSKT, uppmatt i drift 2026-09-06: en `authenticated` som inte
       // ager raden far **0 rader och inget fel** - en USING-policy FILTRERAR, den
-      // kastar inte. Samma sak vid en utgangen session, dar `auth.uid()` blir null.
+      // kastar inte.
       //
       //   ✅ natverksfel och 401  -> felobjekt, fangas nedan
-      //   ❌ RLS-filtrering och utgangen session -> 0 rader, inget fel, STAR KVAR
+      //   ❌ RLS-filtrering        -> 0 rader, inget fel, STAR KVAR
+      //
+      // ⚠️ En tidigare version skrev "samma sak vid en utgangen session". Det ar
+      // INTE matt och hangdes pa en matning som inte omfattar det: en utgangen JWT
+      // avvisas av PostgREST FORE policyn, med 401 och ett felobjekt - alltsa
+      // felgrenen. Pastaendet kan stamma for en MISSLYCKAD refresh dar begaran gar
+      // som anon, men det har varken jag eller granskaren matt. Sag det inte igen
+      // utan att mata: skicka en begaran med (a) utgangen anvandar-JWT och (b)
+      // enbart anon-nyckeln, och jamfor status och error.
       //
       // Den kvarvarande vagen kraver ett annat grepp (verifiera sessionen, eller
       // gora upserten icke-destruktiv) och ligger som eget fynd i issue #66.
@@ -974,6 +982,25 @@
         // raden ar dold - da skrivs det ifyllda plus null for resten. Men da anger
         // kunden aktivt faktureringsdata, vilket ar en annan handling an att spara
         // ett orort formular. Skriv inte om det har till att halet ar stangt.
+        //
+        // 🔴 OCH DET VIKTIGASTE SPARREN INTE RACKER TILL: profiles-uppdateringen
+        // tre rader ned lyder under SAMMA sorts USING-policy. Uppmatt i drift
+        // 2026-09-06: en update under fel uid traffar **0 rader och ger inget fel**.
+        //
+        // I exakt det scenario den har sparren ar byggd for - raden dold - skrivs
+        // alltsa inte heller kundens NAMNBYTE, och hon far anda "Uppgifterna ar
+        // sparade". Portalen satter dessutom profile.full_name lokalt, sa UI:t
+        // visar det nya vardet tills sidan laddas om.
+        //
+        // Det ar inte en regression - meddelandet fanns fore sparren. Men sparren
+        // gor scenariot till ett erkant driftlage, och da hor det tysta no-op:et
+        // hemma i samma kommentar. Ett update som ger noll rader betyder att
+        // ingenting andrades, aldrig att det gick bra. Eget fynd i issue #66.
+        //
+        // 📌 Sidoeffekt, kontrollerad och ofarlig: for en AKTA ny kund som lamnar
+        // fakturafalten tomma skapas nu ingen tom rad alls (forut skapades en med
+        // idel null). Bada konsumenterna tal det - bada anvander maybeSingle eller
+        // en null-vakt, och approveOffer kraver anda ifyllda falt.
         var tomFaktura = !bill.company && !bill.org_nr && !bill.address &&
                          !bill.postal_city && !bill.invoice_email && !bill.reference;
         var skrivningar = [sb.from("profiles").update({ full_name: newName, company: newCompany }).eq("id", session.user.id)];
