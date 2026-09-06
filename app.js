@@ -205,7 +205,7 @@
     } catch (e) {
       // ⚠️ Den SYNKRONA grenen (crypto.subtle saknas helt) hade kvar tystnaden
       // aven efter forsta rattningen - granskarens fynd B. Den delar nu markor och
-      // console.warn med den asynkrona, sa `hashSaknas()` nedan fangar bada.
+      // console.warn med den asynkrona, sa `kontrollsummaOk()` nedan fangar bada.
       if (window.console && console.warn) console.warn("[oakstride] sha256 (synkront):", e);
       return Promise.resolve("nohash-" + str.length);
     }
@@ -214,10 +214,81 @@
   // Markoren fran sha256Hex fallback. Bada grenarna returnerar "nohash-<längd>", sa
   // anroparen kan se att dokumentets kontrollsumma ar en platshallare - utan nagon
   // delad flagga. Kvittotexten sager det i stallet for att latsas om saken.
-  function hashSaknas(hash) {
-    return typeof hash === "string" && hash.indexOf("nohash-") === 0;
+  // 🔴 RATTAT efter granskning av #69. Har stod en NEGATIV kontroll:
+  // `hash.indexOf("nohash-") === 0`, alltsa bunden till en magisk strang som satts
+  // pa tva andra stallen i sha256Hex. Andrar nagon markoren i den ena grenen blir
+  // vakten blind for just den grenen, och ingenting i repot gar rott - portalen har
+  // inga prov.
+  //
+  // Den positiva formen svarar pa den fraga vi faktiskt staller: ar det har en
+  // riktig SHA-256? Den blockerar oberoende av markoren, och den fangar dessutom
+  // allt som inte ar en strang (undefined, null, 0, objekt) - onabart i dag, men
+  // "kan inte skrivas" blir strukturellt sant i stallet for konventionellt sant.
+  function kontrollsummaOk(hash) {
+    return typeof hash === "string" && /^[0-9a-f]{64}$/.test(hash);
   }
-  // 🔴 TILLAGT efter granskningens omgang 3. `hashSaknas(hash)` ensam ar FEL
+  // 🔴 FREDRIKS BESLUT, kort k-20260906-01, ordagrant: "Blockera
+  // godkannandet om kontrollsumman inte kan beraknas".
+  //
+  // Avtalet lovar kunden en SHA-256-kontrollsumma av villkorstexten (se
+  // buildAgreement). Kunde den inte beraknas skrev koden forut en attrapp och lat
+  // godkannandet ga igenom anda - en rad i agreement_acceptances som inte uppfyller
+  // det avtalet lovar. Nu skrivs ingen rad alls.
+  //
+  // Anropas FORE varje insert mot agreement_acceptances. Returnerar true om
+  // anroparen ska avbryta.
+  // 🔴 RATTAT efter granskning av #69 - och det ar tredje gangen samma
+  // lardom i den har filen. Forsta versionen la varningen i en gren som aldrig kors.
+  // Andra la den i en toast som skrevs over av FRAMGANGEN. Den har la den i en toast
+  // som skrevs over av KLOCKAN: 256 tecken som slacker sig sjalv efter 3500 ms, och
+  // bada aterstallningsvagarna raderar samtidigt varje spar av att nagot hant. Efter
+  // fyra sekunder var skarmen tecken for tecken identisk med "kunden gjorde
+  // ingenting" - i ett lage som ar DETERMINISTISKT for hennes webblasare, sa hon far
+  // samma tomma skarm hur manga ganger hon an forsoker.
+  //
+  // Nu skrivs beskedet ocksa i en BESTANDIG yta (`status-note error`), samma monster
+  // som filen redan anvander pa nio stallen. Toasten star kvar for den som tittar
+  // just da; ytan star kvar for den som tittade bort.
+  //
+  // ⚠️ Vad detta INTE loser: OakStride far fortfarande inget besked. Vid blockering
+  // skrivs ingen rad, sa `notify_agreement_accepted` fyrar inte, och nagon annan
+  // larmvag finns inte. Kunden ar alltsa den enda som vet - och hon ombeds hora av
+  // sig. Att bygga en serverside-larmvag ar ett eget beslut (Fredrik sa 2026-09-06,
+  // om en annan kanal: "bygg ingen ny kanal"), och det ska inte smygas in har.
+  // 🔴 TILLAGT efter granskningens runda 2, fynd 3. Vakten nedan gav
+  // hash-felet en bestandig yta - medan SYSKONFELEN i samma funktioner toastade
+  // vidare. Foljden var att ett verkligt DATABASFEL blev mindre synligt for kunden
+  // an ett hash-fel: att beviset for godkannandet inte skrevs slacktes efter 3500 ms
+  // och lamnade samma tomma skarm som fallde runda 1. Det var runda 1:s eget
+  // argument, tillampat pa grannraden.
+  //
+  // Blir sarskilt viktigt nar migration 34 landar: en blockerad skrivning ger da
+  // 23514 fran databasen, och den landar i just de har felgrenarna.
+  function visaFel(notisId, text) {
+    var n = notisId ? document.getElementById(notisId) : null;
+    if (n) { n.hidden = false; n.className = "status-note error"; n.textContent = text; }
+    toast(text, true);
+  }
+  function blockeraUtanKontrollsumma(hash, aterstall, notisId) {
+    if (kontrollsummaOk(hash)) return false;
+    visaFel(notisId, "Godkännandet gick INTE igenom. Din webbläsare kunde inte beräkna den kontrollsumma som avtalet kräver, och vi registrerar hellre ingenting än ett godkännande som saknar den. Prova en annan webbläsare, eller hör av dig till OakStride så löser vi det åt dig.");
+    if (window.console && console.warn) console.warn("[oakstride] godkannande blockerat: kontrollsumman kunde inte beraknas");
+    if (typeof aterstall === "function") aterstall();
+    return true;
+  }
+  // ⚠️ BORTTAGET 2026-09-06: hashNotis/HASH_NOTIS lag har och gav kunden en
+  // NOTIS i kvittot nar kontrollsumman saknades. Efter Fredriks beslut skrivs ingen
+  // sadan rad langre - notisen ar alltsa dod kod, och tva mekanismer for samma sak
+  // ar precis det monster som fallde konfliktreceptet i agent#51: tva kallor till
+  // samma sanning, dar bara den ena styr utfallet. Historiken bevarar resonemanget.
+  //
+  // Det som star kvar av den gamla kommentaren, for att det galler an: en rad som
+  // REDAN ligger i drift med en attrapp far inget besked den har vagen. Matt
+  // 2026-09-06: noll sadana rader (0 av 1).
+  //
+  // (Gammal kommentar, bevarad for sammanhang. `hashSaknas` finns inte langre -
+  // den ersattes av den positiva `kontrollsummaOk` ovan. Resonemanget galler an:)
+  // markoren ensam ar FEL
   // signal i kvittot: den laser klientens nyberaknade hash, och enda vagen som inte
   // returnerar tidigt ar 23505 - alltsa "raden fanns redan, INGENTING skrevs".
   // agreement_acceptances har unique (user_id, agreement_version), sa 23505 ar inte
@@ -244,11 +315,6 @@
   // koden fortfarande ratt, men da finns kunder vars godkannande saknar
   // kontrollsumma utan att portalen sager det - och det ar ett eget arende till
   // Fredrik, skilt fran k-20260906-01 som handlar om att blockera framat.
-  function hashNotis(res, hash) {
-    var skrevs = !(res && res.error);       // 23505 = fanns redan, inget skrevs
-    return (skrevs && hashSaknas(hash)) ? HASH_NOTIS : "";
-  }
-  var HASH_NOTIS = " OBS: kontrollsumman för avtalet kunde inte beräknas i din webbläsare, så godkännandet saknar den. Hör av dig till OakStride så noterar vi det.";
 
   // 5-stegsflödet. form: steg 1 klart via projektförfrågan. offer: steg 3 = godkänn
   // kravspec/offert + villkor + faktureringsuppgifter. site: steg 4 = godkänn sida & konfig.
@@ -812,6 +878,17 @@
   function acceptTerms(btn) {
     btn.disabled = true;
     sha256Hex(custAgreement.version + "\n" + custAgreement.html).then(function (hash) {
+      // ⚠️ `agree-status` FINNS INTE i repot. Uppmatt: tre forekomster, alla i
+      // den har filen - den har raden, argumentet nedan och den gamla felgrenens
+      // getElementById. Ingen av dem SKAPAR elementet, och renderTermsView renderar
+      // ingen statusyta. Argumentet ar alltsa en no-op och funktionen faller tillbaka
+      // pa enbart toasten.
+      //
+      // Det lamnas sa med flit: acceptTerms anropas inte fran nagot hall (markt
+      // ovan), sa att rendera en yta at den vore att bygga UI for dod kod. Men
+      // pastaendet att ytan finns var falskt, och det ar det som rattas har - nasta
+      // lasare ska inte tro att den finns for att en kommentar sa det.
+      if (blockeraUtanKontrollsumma(hash, function () { btn.disabled = false; }, "agree-status")) return;
       sb.from("agreement_acceptances").insert({
         user_id: cuid(),
         agreement_version: custAgreement.version,
@@ -824,7 +901,7 @@
           if (n) { n.hidden = false; n.className = "status-note error"; n.textContent = "Kunde inte spara: " + res.error.message; }
           btn.disabled = false; return;
         }
-        toast("Tack! Villkoren är godkända." + hashNotis(res, hash), !!hashNotis(res, hash));
+        toast("Tack! Villkoren är godkända.");
         loadOnboarding();
       });
     });
@@ -1803,7 +1880,8 @@
                 clarFormHtml() +
                 '<label class="agree-check"><input type="checkbox" id="agree-cb"> <span>Jag har läst och godkänner kravspecifikationen/offerten (v' + spec.version + ") och OakStrides kundvillkor (version " + esc(custAgreement.version) + ").</span></label>" +
                 billingFormHtml(billing) +
-                '<button id="btn-approve-offer" class="btn btn-primary btn-inline" disabled>Godkänn offert &amp; villkor</button>';
+                '<button id="btn-approve-offer" class="btn btn-primary btn-inline" disabled>Godkänn offert &amp; villkor</button>' +
+                '<p id="hash-status-offert" class="status-note" hidden></p>';
             } else {
               body += '<p class="muted">Blir aktivt när föregående steg är klart.</p>';
             }
@@ -1839,7 +1917,8 @@
                 body += '<p class="muted">Vi har uppdaterat kravspecifikationen &amp; offerten utifrån dina önskemål. Godkänn den nya versionen innan lansering:</p>' +
                   '<div class="onb-offer4"><h4>Uppdaterad kravspecifikation &amp; offert (v' + spec.version + ")</h4>" +
                   '<div class="onb-docs"><button type="button" class="btn btn-ghost btn-sm js-open-spec">Öppna kravspecifikation &amp; offert &#8599;</button></div>' +
-                  '<label class="onb-confirm"><input type="checkbox" data-approve-offer4="' + spec.version + '"> <span>Jag godkänner den uppdaterade kravspecifikationen och offerten (v' + spec.version + ")</span></label></div>";
+                  '<label class="onb-confirm"><input type="checkbox" data-approve-offer4="' + spec.version + '"> <span>Jag godkänner den uppdaterade kravspecifikationen och offerten (v' + spec.version + ")</span></label>" +
+                  '<p id="hash-status-uppdaterad" class="status-note" hidden></p></div>';
               }
               if (done[5]) {
                 body += '<p class="onb-verified">✓ Du har godkänt sidan — vi lanserar den inom kort och meddelar dig.</p>';
@@ -1894,15 +1973,34 @@
 
   // Steg 4: godkänn den uppdaterade kravspecen/offerten (faktureringsuppgifter finns redan).
   function approveUpdatedOffer(spec, ordered) {
-    if (previewBlocked()) return;
-    if (!spec) return;
+    // Aven de tva tidiga utgangarna kryssar ur: i forhandslage toastar
+    // previewBlocked() att inget gar att andra, och da ska rutan inte sta kvar
+    // ikryssad bredvid det beskedet. `kryssaUr` ar en funktionsdeklaration langre
+    // ned i samma slutning och ar alltsa hoistad hit.
+    if (previewBlocked()) { kryssaUr(); return; }
+    if (!spec) { kryssaUr(); return; }
     var summary = orderSummaryText(spec.data, ordered);
+    // Den har vagen fyras av en KRYSSRUTA, inte en knapp. Varje utgang som INTE
+    // lyckas maste darfor kryssa ur den - annars star rutan kvar ikryssad, alltsa
+    // ser godkand ut, samtidigt som notisen bredvid sager att det inte gick. Och ett
+    // nytt forsok kraver da TVA klick, for change-hanteraren fyrar bara pa
+    // `offer4.checked`: kunden maste forst kryssa ur och sedan i igen.
+    //
+    // 🔴 RATTAT efter granskningens runda 3. Uncheckningen fanns bara pa
+    // VAKTENS vag - de tva databasfelgrenarna nedan lamnade rutan ikryssad. Jag skrev
+    // sjalv skalet till uncheckningen nar jag la den pa vakten, och da galler det
+    // lika mycket dar. Ett stalle kryssar ur; tre vagar anvander det.
+    function kryssaUr() {
+      var ruta = document.querySelector("[data-approve-offer4]");
+      if (ruta) ruta.checked = false;
+    }
     sha256Hex(custAgreement.version + "\n" + custAgreement.html).then(function (hash) {
+      if (blockeraUtanKontrollsumma(hash, kryssaUr, "hash-status-uppdaterad")) return;
       sb.from("agreement_acceptances").insert({
         user_id: cuid(), agreement_version: custAgreement.version, document_title: custAgreement.title,
         document_hash: hash, user_agent: navigator.userAgent, order_summary: summary
       }).then(function (r2) {
-        if (r2.error && r2.error.code !== "23505") { toast("Kunde inte spara: " + r2.error.message, true); return; }
+        if (r2.error && r2.error.code !== "23505") { visaFel("hash-status-uppdaterad", "Kunde inte spara: " + r2.error.message); kryssaUr(); return; }
         // 🔴 TILLAGT efter tystnadsgranskning (blockerande fynd 1). Callbacken
         // tog INGET argument - `res.error` lastes aldrig. Tabellen har primarnyckel
         // (user_id, spec_version), sa ett dubbelklick ger en realistisk 23505; men
@@ -1916,13 +2014,13 @@
         // 23505 ar avsiktlig idempotens (redan godkant), inte ett svalt fel.
         sb.from("extra_work_approvals").insert({ user_id: cuid(), spec_version: spec.version }).then(function (r3) {
           if (r3 && r3.error && r3.error.code !== "23505") {
-            toast("Godkännandet kunde inte registreras: " + (r3.error.message || "okänt fel") +
-                  ". Försök igen, eller hör av dig till OakStride.", true);
+            visaFel("hash-status-uppdaterad", "Godkännandet kunde inte registreras: " +
+                    (r3.error.message || "okänt fel") + ". Försök igen, eller hör av dig till OakStride.");
             if (window.console && console.warn) console.warn("[oakstride] extra_work_approvals:", r3.error);
+            kryssaUr();
             return;
           }
-          toast("Tack! Den uppdaterade offerten är godkänd — en ny orderbekräftelse skickas." +
-                hashNotis(r2, hash), !!hashNotis(r2, hash));
+          toast("Tack! Den uppdaterade offerten är godkänd — en ny orderbekräftelse skickas.");
           loadOnboarding();
         });
       });
@@ -1938,26 +2036,29 @@
     btn.disabled = true;
     b.user_id = cuid(); b.updated_at = new Date().toISOString();
     sb.from("billing_details").upsert(b).then(function (r1) {
-      if (r1.error) { toast("Kunde inte spara faktureringsuppgifter: " + r1.error.message, true); btn.disabled = false; return; }
+      if (r1.error) { visaFel("hash-status-offert", "Kunde inte spara faktureringsuppgifter: " + r1.error.message); btn.disabled = false; return; }
       var summary = orderSummaryText(spec.data, ordered);
       sha256Hex(custAgreement.version + "\n" + custAgreement.html).then(function (hash) {
+        // 🔴 Faktureringsuppgifterna ar redan sparade har (upserten ovan).
+        // Det ar med flit: de ar kundens egna uppgifter och ska inte kastas bort for
+        // att kontrollsumman felade. Det som INTE skrivs ar godkannandet.
+        if (blockeraUtanKontrollsumma(hash, function () { btn.disabled = false; }, "hash-status-offert")) return;
         sb.from("agreement_acceptances").insert({
           user_id: cuid(), agreement_version: custAgreement.version, document_title: custAgreement.title,
           document_hash: hash, user_agent: navigator.userAgent, order_summary: summary
         }).then(function (r2) {
-          if (r2.error && r2.error.code !== "23505") { toast("Kunde inte spara godkännande: " + r2.error.message, true); btn.disabled = false; return; }
+          if (r2.error && r2.error.code !== "23505") { visaFel("hash-status-offert", "Kunde inte spara godkännande: " + r2.error.message); btn.disabled = false; return; }
           // 🔴 TILLAGT efter tystnadsgranskning (blockerande fynd 1) - samma
           // ovakade insert som i approveUpdatedOffer, har med btn kvar att aterstalla.
           sb.from("extra_work_approvals").insert({ user_id: cuid(), spec_version: spec.version }).then(function (r3) {
             if (r3 && r3.error && r3.error.code !== "23505") {
-              toast("Godkännandet kunde inte registreras: " + (r3.error.message || "okänt fel") +
-                    ". Försök igen, eller hör av dig till OakStride.", true);
+              visaFel("hash-status-offert", "Godkännandet kunde inte registreras: " +
+                      (r3.error.message || "okänt fel") + ". Försök igen, eller hör av dig till OakStride.");
               if (window.console && console.warn) console.warn("[oakstride] extra_work_approvals:", r3.error);
               btn.disabled = false;
               return;
             }
-            toast("Tack! Offert och villkor godkända — en orderbekräftelse skickas till din e-post." +
-                  hashNotis(r2, hash), !!hashNotis(r2, hash));
+            toast("Tack! Offert och villkor godkända — en orderbekräftelse skickas till din e-post.");
             loadOnboarding();
           });
         });
