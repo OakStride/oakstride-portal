@@ -217,6 +217,25 @@
   function hashSaknas(hash) {
     return typeof hash === "string" && hash.indexOf("nohash-") === 0;
   }
+  // 🔴 TILLAGT efter granskningens omgang 3. `hashSaknas(hash)` ensam ar FEL
+  // signal i kvittot: den laser klientens nyberaknade hash, och enda vagen som inte
+  // returnerar tidigt ar 23505 - alltsa "raden fanns redan, INGENTING skrevs".
+  // agreement_acceptances har unique (user_id, agreement_version), sa 23505 ar inte
+  // exotiskt: approveUpdatedOffer fyras vid varje uppdaterad offert och
+  // villkorsversionen ar ofta densamma.
+  //
+  // Da blir bada riktningarna fel (uppmatt av granskaren i en korning av filen):
+  //   godkant forr med riktig hash, aterkommer i trasig webblasare
+  //     -> 23505 -> kvittot pastar att kontrollsumman saknas. Falskt larm.
+  //   godkant forr med nohash-, aterkommer i frisk webblasare
+  //     -> 23505 -> kvittot tiger. Raden saknar fortfarande kontrollsumma.
+  //
+  // Vi kan bara uttala oss om en rad vi SJALVA skrev. Skrevs ingen: sag inget om
+  // kontrollsumman - varningen gavs vid det tillfalle raden faktiskt skrevs.
+  function hashNotis(res, hash) {
+    var skrevs = !(res && res.error);       // 23505 = fanns redan, inget skrevs
+    return (skrevs && hashSaknas(hash)) ? HASH_NOTIS : "";
+  }
   var HASH_NOTIS = " OBS: kontrollsumman för avtalet kunde inte beräknas i din webbläsare, så godkännandet saknar den. Hör av dig till OakStride så noterar vi det.";
 
   // 5-stegsflödet. form: steg 1 klart via projektförfrågan. offer: steg 3 = godkänn
@@ -793,7 +812,7 @@
           if (n) { n.hidden = false; n.className = "status-note error"; n.textContent = "Kunde inte spara: " + res.error.message; }
           btn.disabled = false; return;
         }
-        toast("Tack! Villkoren är godkända." + (hashSaknas(hash) ? HASH_NOTIS : ""), hashSaknas(hash));
+        toast("Tack! Villkoren är godkända." + hashNotis(res, hash), !!hashNotis(res, hash));
         loadOnboarding();
       });
     });
@@ -1509,9 +1528,20 @@
             // storage-policyn for DELETE lyder
             //   foldername[1] = auth.uid() OR is_admin()
             // och i "visa som kund" ar sessionen fortfarande ADMINENS. `is_admin()`
-            // ar alltsa sant, och raderingen GAR IGENOM. En admin som tittar som
-            // kund kunde permanent radera kundens uppladdade bild - i ett lage vars
-            // hela syfte ar "du kan inte gora andringar som kunden".
+            // ar alltsa sant, och raderingen GAR IGENOM pa databassidan. Skyddet kan
+            // darfor bara ligga har i granssnittet.
+            //
+            // 🔴 RATTAT efter granskningens omgang 3 - min forsta kommentar
+            // namngav FEL LAGE, och det ar precis den sortens pastaende som gor att
+            // nasta lasare inte tittar efter. Det finns TVA lagen, inte ett:
+            //   ?preview=<uid>  satter previewUid -> previewBlocked() ar sant
+            //                   -> vakten nedan galler. Det ar det har den stanger.
+            //   knappen "Visa som kund" satter actingUid och lamnar previewUid NULL
+            //                   -> vakten galler INTE, och raderingen gar igenom.
+            // Det andra ar avsiktligt skrivbart (se raderna vid actingUid), sa det ar
+            // ingen bugg att laga i forbigaende - men det ar en oppen fraga om en
+            // admin ska kunna radera kundens bild permanent i det laget. Den ligger
+            // som kort hos Fredrik; utvidga inte vakten sjalv innan han svarat.
             //
             // Uppmatt i pg_policies 2026-09-06. Skydd finns bara i granssnittet,
             // sa det maste finnas HAR.
@@ -1873,7 +1903,7 @@
             return;
           }
           toast("Tack! Den uppdaterade offerten är godkänd — en ny orderbekräftelse skickas." +
-                (hashSaknas(hash) ? HASH_NOTIS : ""), hashSaknas(hash));
+                hashNotis(r2, hash), !!hashNotis(r2, hash));
           loadOnboarding();
         });
       });
@@ -1908,7 +1938,7 @@
               return;
             }
             toast("Tack! Offert och villkor godkända — en orderbekräftelse skickas till din e-post." +
-                  (hashSaknas(hash) ? HASH_NOTIS : ""), hashSaknas(hash));
+                  hashNotis(r2, hash), !!hashNotis(r2, hash));
             loadOnboarding();
           });
         });
@@ -2287,10 +2317,21 @@
           // utan fel - och admin far "Status uppdaterad." Lagre insats an kundens
           // knapp, men samma rad i samma funktion: monstret dar rattelsen bara nadde
           // ett av stallena.
-          sb.from("requests").update({ status: e.target.value }).eq("id", id).select("id").then(function (res) {
-            var skrivna = (res && res.data) ? res.data.length : 0;
+          // ⚠️ Radraknining rackte INTE, tvartemot vad jag skrev forst. De tva
+          // UPDATE-policyerna pa requests OR:as: is_admin() ELLER user_id = auth.uid().
+          // Ar is_admin() falskt men adminen rakar aga arendet traffas raden via den
+          // andra policyn, protect_request_cols gor `new := old`, updaten lyckas med
+          // 1 rad - och ingenting andrades. Las darfor tillbaka VARDET, som kundens
+          // knapp gor. (Uppmatt i drift 2026-09-06: triggerkroppen i drift ar identisk
+          // med repots, sa den hoppas over for en akta admin - men det ar just nar
+          // is_admin() ar falskt den har vagen oppnar sig.)
+          var vald = e.target.value;
+          sb.from("requests").update({ status: vald }).eq("id", id).select("status").then(function (res) {
+            var ny = (res && res.data && res.data[0]) ? res.data[0].status : null;
             if (res && res.error) toast("Kunde inte uppdatera status: " + res.error.message, true);
-            else if (!skrivna) toast("Statusen ändrades inte — ingen rad uppdaterades. Ladda om sidan och kontrollera att du fortfarande är inloggad som admin.", true);
+            else if (ny !== vald) toast("Statusen ändrades inte — ärendet står kvar som " +
+                  (ny ? (labels[ny] || ny) : "oförändrat") +
+                  ". Ladda om sidan och kontrollera att du fortfarande är inloggad som admin.", true);
             else toast("Status uppdaterad.");
           });
         });
