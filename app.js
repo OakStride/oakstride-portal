@@ -895,7 +895,20 @@
       //
       // ⚠️ Det som gor felet svart att se: `maybeSingle()` ger `data = null,
       // error = null` for en kund UTAN rad. Ett tomt formular ar alltsa helt
-      // riktigt for en ny kund. Det ENDA som skiljer lagena at ar `error`.
+      // riktigt for en ny kund.
+      //
+      // 🔴 OCH DEN HAR KONTROLLEN RACKER INTE HELA VAGEN. En tidigare version av
+      // den har kommentaren pastod att "det ENDA som skiljer lagena at ar error".
+      // Det ar FALSKT, uppmatt i drift 2026-09-06: en `authenticated` som inte
+      // ager raden far **0 rader och inget fel** - en USING-policy FILTRERAR, den
+      // kastar inte. Samma sak vid en utgangen session, dar `auth.uid()` blir null.
+      //
+      //   ✅ natverksfel och 401  -> felobjekt, fangas nedan
+      //   ❌ RLS-filtrering och utgangen session -> 0 rader, inget fel, STAR KVAR
+      //
+      // Den kvarvarande vagen kraver ett annat grepp (verifiera sessionen, eller
+      // gora upserten icke-destruktiv) och ligger som eget fynd i issue #66.
+      // Skriv inte om det har stycket till nagot lugnare utan att mata om.
       //
       // Fixen ar inte att validera vid submit - en kund ska kunna tomma ett falt.
       // Fixen ar att aldrig visa ett formular byggt pa data vi inte fick.
@@ -903,8 +916,8 @@
         main.innerHTML =
           '<button class="back-link" id="btn-acc-back">&larr; Tillbaka</button>' +
           '<div class="card" style="max-width:600px"><h1>Mina uppgifter</h1>' +
-          '<p class="status-note error">Dina uppgifter kunde inte hamtas just nu: ' + esc(res.error.message) + '</p>' +
-          '<p class="muted">Formuläret visas inte, eftersom ett tomt formulär hade kunnat spara över dina faktureringsuppgifter. Ladda om sidan och försök igen — ingenting har ändrats.</p>' +
+          '<p class="status-note error">Dina uppgifter kunde inte hämtas just nu: ' + esc(res.error.message) + '</p>' +
+          '<p class="muted">Formuläret visas inte, eftersom ett tomt formulär hade kunnat spara över dina faktureringsuppgifter. Ingenting har ändrats.</p>' +
           '<button class="btn btn-primary btn-inline" id="btn-acc-retry">Försök igen</button></div>';
         document.getElementById("btn-acc-back").addEventListener("click", function () {
           if (profile.is_admin && !viewAsCustomer) renderAdmin(); else renderCustomer();
@@ -912,7 +925,10 @@
         document.getElementById("btn-acc-retry").addEventListener("click", renderAccount);
         return;
       }
-      var b = res.data || {};
+      // `res &&` behalls: felgrenen ovan har den, och utan den kastar raden
+      // TypeError inuti en .then() utan .catch - da star spinnern kvar for evigt
+      // utan felkort. Gamla koden degraderade i stallet till tomt formular.
+      var b = (res && res.data) ? res.data : {};
       function f(id, label, val, ph, type) { return '<label for="' + id + '">' + esc(label) + '</label><input type="' + (type || "text") + '" id="' + id + '" value="' + esc(val || "") + '"' + (ph ? ' placeholder="' + esc(ph) + '"' : "") + ">"; }
       main.innerHTML =
         '<button class="back-link" id="btn-acc-back">&larr; Tillbaka</button>' +
