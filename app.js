@@ -2311,7 +2311,19 @@
             // `requests.status` blev kvar pa t.ex. `new`, och ingen fick veta det.
             //
             // ⚠️ `.select("id")` av samma skal som i renderAccount: en USING-filtrerad
-            // update FELAR INTE, den traffar noll rader. Uppmatt 2026-09-06.
+            // update FELAR INTE, den traffar noll rader.
+            //
+            // Matprotokollet, sa att pastaendet har en kalla om ett halvar (granskningens
+            // N8 - ett 'uppmatt' utan protokoll ar ett pastaende, inte en matning):
+            //
+            //   begin;
+            //   set local role authenticated;
+            //   set local request.jwt.claims = '{"sub":"...0042","role":"authenticated"}';
+            //   update public.profiles set full_name = '...' where id = <annan anvandares rad>
+            //   returning id;
+            //   rollback;
+            //
+            // Utfall 2026-09-06 mot driftdatabasen: 0 andrade rader, ingen felkod.
             sb.from("requests").update({ status: "in_progress" }).eq("id", id).select("id").then(function (up) {
               var skrivna = (up && up.data) ? up.data.length : 0;
               if ((up && up.error) || !skrivna) {
