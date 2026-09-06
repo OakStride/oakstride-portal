@@ -1005,7 +1005,13 @@
                          !bill.postal_city && !bill.invoice_email && !bill.reference;
         // `.select("id")` sa vi far tillbaka de rader som FAKTISKT skrevs. Utan den
         // kan vi bara se om anropet felade - och en USING-filtrerad update felar inte,
-        // den traffar noll rader. Se raknningen i .then() nedan.
+        // den traffar noll rader. Se rakningen i .then() nedan.
+        //
+        // ⚠️ Varfor bara HAR och inte pa upserten: billing_details-policyn har en
+        // `with check`-halva, och en skrivning under fel uid avvisas darfor med 42501
+        // i stallet for att tyst traffa noll rader. Uppmatt 2026-09-06. Far tabellen
+        // nagon gang en policy dar en USING-halva kan filtrera utan att `with check`
+        // fyrar, ar halet tillbaka och tyst - lagg da `.select()` har ocksa.
         var skrivningar = [sb.from("profiles").update({ full_name: newName, company: newCompany }).eq("id", session.user.id).select("id")];
         if (hadeRad || !tomFaktura) skrivningar.push(sb.from("billing_details").upsert(bill));
 
@@ -1028,7 +1034,17 @@
           var skrivna = (rs[0] && rs[0].data) ? rs[0].data.length : 0;
           if (!skrivna) {
             note.hidden = false; note.className = "status-note error";
-            note.textContent = "Ingenting sparades — din inloggning verkar inte längre gälla. Logga ut och in igen, så försvinner inget av det du fyllt i här.";
+            // ⚠️ Sag bara det koden VET: data.length === 0, alltsa att ingenting
+            // skrevs. Orsaken kan vara RLS-filtrering, en saknad profiles-rad eller
+            // ett id som inte matchar - koden kan inte skilja dem at, och en utpekad
+            // orsak skickar bade kunden och supporten at fel hall.
+            //
+            // 🔴 Och lova inte att inmatningen overlever. En tidigare version sa
+            // "logga ut och in, sa forsvinner inget av det du fyllt i har". Det ar
+            // FALSKT: formularet renderas om fran databasen och allt hon skrivit ar
+            // borta. I en fix vars hela syfte ar att sluta ge falska besked var det
+            // den samsta tankbara meningen.
+            note.textContent = "Ingenting sparades — ändringen gick inte igenom. Det du skrivit står kvar i fälten, så prova Spara igen. Hjälper inte det: skriv av uppgifterna först, logga sedan ut och in — fälten töms när sidan laddas om.";
             return;
           }
           profile.full_name = newName; profile.company = newCompany;
