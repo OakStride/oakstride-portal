@@ -766,6 +766,18 @@
 
   // ---------- Villkorsgodkännande (inuti flödet) ----------
 
+  // 🚧 ANROPAS INTE FRAN NAGOT HALL. Kontrollerat 2026-09-06 med grep over
+  // hela repot: enda traffen ar den har definitionsraden. Steg 2:s kryssruta gar
+  // till checkoffStep(2) och steg 3:s knapp till approveOffer.
+  //
+  // Funktionen star kvar orord i den har PR:en - att ta bort kod ar en annan
+  // andring an att laga tystnad, och den ska inte smygas in i en fix. Men den ar
+  // MARKT, for annars ar den en falla: nasta person som ska rora
+  // villkorsgodkannandet laser den har funktionen, tror sig ha hittat vagen, och
+  // lagger sin andring dar ingen kund kommer.
+  //
+  // Mitt eget matunderlag "tre av tre kvitton bar notisen" gallde alltsa tre
+  // stallen i KODEN, varav tva ar naabara for en kund. Rattat i PR-texten.
   function acceptTerms(btn) {
     btn.disabled = true;
     sha256Hex(custAgreement.version + "\n" + custAgreement.html).then(function (hash) {
@@ -1343,7 +1355,7 @@
   }
 
   function sendAIChat(cp, active) {
-    if (typeof previewBlocked === "function" && previewBlocked()) return;
+    if (previewBlocked()) return;
     var ta = document.getElementById("aichat-msg"); if (!ta) return;
     var msg = (ta.value || "").trim(); if (!msg) return;
     var btn = document.querySelector("#aichat-form button"); if (btn) { btn.disabled = true; btn.textContent = "Skickar…"; }
@@ -1367,7 +1379,7 @@
 
   // Kunden lanserar utkastet direkt på livesajten (utan admin-granskning).
   function publishChange(active, cp) {
-    if (typeof previewBlocked === "function" && previewBlocked()) return;
+    if (previewBlocked()) return;
     if (!window.confirm("Lansera ändringen direkt på din livesajt?\n\nDen publiceras utan OakStrides granskning.")) return;
     sb.rpc("request_publish_change", { p_request_id: active.id }).then(function (r) {
       if (r.error || (r.data && r.data.ok === false)) {
@@ -1381,7 +1393,7 @@
 
   // Kunden ber OakStride granska & publicera (draft_ready → approved).
   function requestReview(active, cp) {
-    if (typeof previewBlocked === "function" && previewBlocked()) return;
+    if (previewBlocked()) return;
     sb.from("requests").update({ status: "approved" }).eq("id", active.id).then(function (r) {
       if (r.error) { toast("Kunde inte skicka för granskning: " + r.error.message, true); return; }
       toast("Skickat till OakStride för granskning & publicering.");
@@ -1503,7 +1515,17 @@
             //
             // Uppmatt i pg_policies 2026-09-06. Skydd finns bara i granssnittet,
             // sa det maste finnas HAR.
-            if (typeof previewBlocked === "function" && previewBlocked()) return;
+            // ⚠️ `typeof previewBlocked === "function" &&` stod har forst. Det ar en
+            // vakt som FALLER OPPET: forsvinner funktionen (namnbyte, filsplit) blir
+            // villkoret tyst falskt och raderingen gar igenom - precis det beteende
+            // vakten skrevs for att stanga. Funktionen ar en deklaration i samma
+            // slutning och alltsa alltid definierad - villkoret skyddade ingenting
+            // och kunde bara dolja ett fel.
+            //
+            // Samma form fanns pa FYRA andra stallen i filen (uppladdningen i samma
+            // vy, plus tre till) och ar borttagen dar ocksa. En rattelse som bara
+            // nar ett stalle ar precis det monster den har PR:en handlar om.
+            if (previewBlocked()) return;
             if (!window.confirm("Ta bort bilden?")) return;
             // 🔴 RATTAT 2026-09-06 (#66, fynd 6). Inget felläge kollades. Misslyckades
             // borttagningen renderades galleriet bara om - bilden lag kvar, utan ett ord
@@ -1529,7 +1551,7 @@
     }
 
     document.getElementById("up-input").addEventListener("change", function (e) {
-      if (typeof previewBlocked === "function" && previewBlocked()) return;
+      if (previewBlocked()) return;
       var files = Array.prototype.slice.call(e.target.files || []);
       if (!files.length) return;
       var st = document.getElementById("up-status");
@@ -1832,7 +1854,24 @@
         document_hash: hash, user_agent: navigator.userAgent, order_summary: summary
       }).then(function (r2) {
         if (r2.error && r2.error.code !== "23505") { toast("Kunde inte spara: " + r2.error.message, true); return; }
-        sb.from("extra_work_approvals").insert({ user_id: cuid(), spec_version: spec.version }).then(function () {
+        // 🔴 TILLAGT efter tystnadsgranskning (blockerande fynd 1). Callbacken
+        // tog INGET argument - `res.error` lastes aldrig. Tabellen har primarnyckel
+        // (user_id, spec_version), sa ett dubbelklick ger en realistisk 23505; men
+        // VILKET fel som helst svaldes likadant, for koden kollade inte ens koden.
+        //
+        // Foljden: kunden sag "Tack! ... en ny orderbekraftelse skickas" medan raden -
+        // sjalva BEVISET for godkannandet - aldrig skrevs. Ingen toast, ingen
+        // console.warn, ingen loggrad. Samma tabell har en annan insert-plats i den
+        // har filen, saveExtraApproval, som gor det ratt sedan tidigare.
+        //
+        // 23505 ar avsiktlig idempotens (redan godkant), inte ett svalt fel.
+        sb.from("extra_work_approvals").insert({ user_id: cuid(), spec_version: spec.version }).then(function (r3) {
+          if (r3 && r3.error && r3.error.code !== "23505") {
+            toast("Godkännandet kunde inte registreras: " + (r3.error.message || "okänt fel") +
+                  ". Försök igen, eller hör av dig till OakStride.", true);
+            if (window.console && console.warn) console.warn("[oakstride] extra_work_approvals:", r3.error);
+            return;
+          }
           toast("Tack! Den uppdaterade offerten är godkänd — en ny orderbekräftelse skickas." +
                 (hashSaknas(hash) ? HASH_NOTIS : ""), hashSaknas(hash));
           loadOnboarding();
@@ -1858,7 +1897,16 @@
           document_hash: hash, user_agent: navigator.userAgent, order_summary: summary
         }).then(function (r2) {
           if (r2.error && r2.error.code !== "23505") { toast("Kunde inte spara godkännande: " + r2.error.message, true); btn.disabled = false; return; }
-          sb.from("extra_work_approvals").insert({ user_id: cuid(), spec_version: spec.version }).then(function () {
+          // 🔴 TILLAGT efter tystnadsgranskning (blockerande fynd 1) - samma
+          // ovakade insert som i approveUpdatedOffer, har med btn kvar att aterstalla.
+          sb.from("extra_work_approvals").insert({ user_id: cuid(), spec_version: spec.version }).then(function (r3) {
+            if (r3 && r3.error && r3.error.code !== "23505") {
+              toast("Godkännandet kunde inte registreras: " + (r3.error.message || "okänt fel") +
+                    ". Försök igen, eller hör av dig till OakStride.", true);
+              if (window.console && console.warn) console.warn("[oakstride] extra_work_approvals:", r3.error);
+              btn.disabled = false;
+              return;
+            }
             toast("Tack! Offert och villkor godkända — en orderbekräftelse skickas till din e-post." +
                   (hashSaknas(hash) ? HASH_NOTIS : ""), hashSaknas(hash));
             loadOnboarding();
