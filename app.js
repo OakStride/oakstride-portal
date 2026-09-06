@@ -172,6 +172,17 @@
         return Array.prototype.map.call(new Uint8Array(h), function (b) {
           return ("0" + b.toString(16)).slice(-2);
         }).join("");
+      // 🔴 RATTAT 2026-09-06 (#66, fynd 2, halva tva). `try/catch` fangar bara
+      // SYNKRONA fel. Avvisades `digest()` ASYNKRONT - ovanligt men mojligt, t.ex.
+      // med ett blockerande tillagg - fyrade `.then()` i anroparna ALDRIG.
+      //
+      // Foljden for kunden: godkann-knappen ar redan satt till disabled nar
+      // anropet gors, sa den blev PERMANENT GRA utan felmeddelande. Hon ser en
+      // klickad knapp som inte gor nagot och maste ladda om sidan for att forsta
+      // att nagot ar fel. Alla tre anropsstallena hade samma hal; darfor sitter
+      // fixen i funktionen och inte i tre kopior.
+      }).catch(function () {
+        return "nohash-" + str.length;
       });
     } catch (e) {
       return Promise.resolve("nohash-" + str.length);
@@ -669,7 +680,20 @@
         pricing = { site_price: Number(r.data.site_price), drift_month: Number(r.data.drift_month), rate_setup: Number(r.data.rate_setup), rate_change: Number(r.data.rate_change) };
         AGREEMENT = buildAgreement(pricing);
       }
-    }, function () {});
+    }, function (e) {
+      // 🔴 RATTAT 2026-09-06 (issue #66, fynd 3). Har stod `function () {}` - en
+      // HELT TOM avslagshanterare. Gick hamtningen fel fortsatte sessionen med den
+      // hardkodade `pricing`-variabeln som global standard, och avtalstexten - det
+      // juridiskt bindande dokumentet - visade da de gamla siffrorna.
+      //
+      // Har admin hojt priserna sag den kunden aldrig hojningen, och ingenting i
+      // granssnittet skilde det fran en lyckad hamtning.
+      //
+      // Vi kan inte AVGORA om siffrorna ar aktuella utan svaret, sa vi sager det
+      // rakt ut i stallet for att lata som om vi vet.
+      toast("Kunde inte hämta aktuella priser — siffrorna nedan kan vara inaktuella. Ladda om sidan innan du godkänner något.", true);
+      if (window.console && console.warn) console.warn("[oakstride] pricing_settings kunde inte hämtas:", e);
+    });
   }
 
   function loadProfileAndRoute() {
@@ -826,6 +850,14 @@
       // Gå in i "agera som kund"-läge: hämta kunderna, välj den första, visa kundvyn.
       sb.from("profiles").select("id, full_name, company, email, website")
         .eq("is_admin", false).order("company", { ascending: true }).then(function (res) {
+          // 🔴 RATTAT 2026-09-06 (#66, fynd 8). `res.error` lastes aldrig, sa ett
+          // FRAGEFEL rapporterades som "det finns inga kunder" - sakligt fel, och en
+          // admin som litar pa texten kan tro att databasen ar tom.
+          if (res && res.error) {
+            toast("Kunde inte hämta kundlistan: " + (res.error.message || "okänt fel") +
+                  ". Det betyder INTE att listan är tom.", true);
+            return;
+          }
           actingCustomers = (res.data || []).filter(function (c) { return c && c.id; });
           if (!actingCustomers.length) { toast("Det finns inga kunder att agera som ännu.", true); return; }
           viewAsCustomer = true;
@@ -1206,6 +1238,19 @@
     var box = document.getElementById("aichat-usage"); if (!box) return;
     sb.rpc("ai_usage_this_month").then(function (res) {
       if (!box.isConnected) return;
+      // 🔴 RATTAT 2026-09-06 (issue #66, fynd 4). `res.error` lastes inte. Vid fel
+      // blev `d = {}` -> used 0, cap 15 -> rutan visade "15 av 15 andringar kvar",
+      // alltsa en fullstandigt frisk siffra, identisk med en ny manad utan
+      // forbrukning. Kunden kunde tro att hela kvoten fanns kvar och bli forvanad
+      // nar nasta forsok stoppades.
+      //
+      // Sjalva spärren sitter i request_ai_draft-RPC:n, sa taket kringgas inte -
+      // det ar informationen som ljuger, inte skyddet.
+      if (res && res.error) {
+        box.className = "aichat-usage";
+        box.innerHTML = "&#9888;&#65039; Kunde inte hämta hur många AI-ändringar du har kvar den här månaden. Siffran visas igen när sidan laddas om.";
+        return;
+      }
       var d = (res && res.data) || {};
       var used = Number(d.used || 0), cap = Number(d.cap || 15);
       var left = Math.max(0, cap - used);
@@ -1415,7 +1460,16 @@
         Array.prototype.forEach.call(g.querySelectorAll("[data-delimg]"), function (btn) {
           btn.addEventListener("click", function () {
             if (!window.confirm("Ta bort bilden?")) return;
-            bucket.remove([btn.getAttribute("data-delimg")]).then(function () { renderGallery(); });
+            // 🔴 RATTAT 2026-09-06 (#66, fynd 6). Inget felläge kollades. Misslyckades
+            // borttagningen renderades galleriet bara om - bilden lag kvar, utan ett ord
+            // om varfor "Ta bort" inte gjorde nagot. Kunden klickar da igen, och igen.
+            bucket.remove([btn.getAttribute("data-delimg")]).then(function (res) {
+              if (res && res.error) {
+                toast("Bilden kunde inte tas bort: " + (res.error.message || "okänt fel") + ". Den ligger kvar.", true);
+                return;
+              }
+              renderGallery();
+            });
           });
         });
       });
@@ -1972,7 +2026,14 @@
       sb.from("requests").select("*, owner:profiles!requests_user_id_fkey(full_name,email,company,website)").eq("id", id).single(),
       sb.from("request_comments").select("*, author:profiles!request_comments_author_id_fkey(full_name,email,is_admin)").eq("request_id", id).order("created_at")
     ]).then(function (out) {
-      var r = out[0].data, comments = out[1].data || [];
+      // 🔴 RATTAT 2026-09-06 (issue #66, fynd 5). `out[1].error` lastes aldrig.
+      // En misslyckad hamtning gav `comments = []`, som renderas som "Inga
+      // meddelanden annu." - exakt som ett arende utan svar. En kund som vantar pa
+      // besked kunde alltsa se en tom trad och tro att ingen svarat, och skriva
+      // igen. `kommentarerFel` bars ned till renderingen i stallet.
+      var r = out[0].data;
+      var kommentarerFel = !!(out[1] && out[1].error);
+      var comments = (out[1] && out[1].data) || [];
       if (out[0].error || !r) { toast("Kunde inte hämta ärendet.", true); isAdmin ? renderAdmin() : renderCustomer(); return; }
       var labels = isAdmin ? STATUS_LABELS_ADMIN : STATUS_LABELS;
       var statusControl = isAdmin
@@ -2049,7 +2110,9 @@
           return '<div class="comment' + cls + '">' +
             '<div class="comment-head"><span class="who">' + esc(who) + "</span> · " + fmtDate(c.created_at) + "</div>" +
             '<div class="comment-body">' + esc(c.body) + "</div></div>";
-        }).join("") : '<p class="muted">Inga meddelanden ännu.</p>') +
+        }).join("") : (kommentarerFel
+             ? '<p class="status-note error">Meddelandena kunde inte hämtas — det här är <strong>inte</strong> samma sak som att inga finns. Ladda om sidan.</p>'
+             : '<p class="muted">Inga meddelanden ännu.</p>')) +
         "</div>" +
         '<form id="form-comment"><label for="c-body">Skriv ett meddelande</label>' +
         '<textarea id="c-body" required placeholder="Ställ en fråga eller lämna mer information…"></textarea>' +
@@ -2075,8 +2138,21 @@
           btnAgent.disabled = true;
           sb.from("agent_jobs").insert({ request_id: id, reason: "draft" }).then(function (res) {
             if (res.error) { toast("Kunde inte starta Claude: " + res.error.message, true); btnAgent.disabled = false; return; }
-            sb.from("requests").update({ status: "in_progress" }).eq("id", id).then(function () {
-              toast("Skickat till Claude — utkast eller frågor dyker upp i dialogen.");
+            // 🔴 RATTAT 2026-09-06 (#66, fynd 7). Hanteraren tog INGET argument - aven
+            // en misslyckad uppdatering gav samma lyckade toast. Jobbet skapades, men
+            // `requests.status` blev kvar pa t.ex. `new`, och ingen fick veta det.
+            //
+            // ⚠️ `.select("id")` av samma skal som i renderAccount: en USING-filtrerad
+            // update FELAR INTE, den traffar noll rader. Uppmatt 2026-09-06.
+            sb.from("requests").update({ status: "in_progress" }).eq("id", id).select("id").then(function (up) {
+              var skrivna = (up && up.data) ? up.data.length : 0;
+              if ((up && up.error) || !skrivna) {
+                toast("Claude är startad, men ärendets status kunde inte sättas till pågående" +
+                      ((up && up.error) ? (": " + up.error.message) : " (ingen rad ändrades)") +
+                      ". Rätta statusen för hand.", true);
+              } else {
+                toast("Skickat till Claude — utkast eller frågor dyker upp i dialogen.");
+              }
               renderDetail(id, isAdmin);
             });
           });
@@ -2326,7 +2402,16 @@
     if (document.getElementById("b-customer")) {
       sb.from("profiles").select("id, company, full_name, email").eq("is_admin", false).order("company", { ascending: true }).then(function (res) {
         var sel = document.getElementById("b-customer");
-        if (!sel || res.error || !res.data) return;
+        if (!sel) return;
+        // 🔴 RATTAT 2026-09-06 (#66, fynd 10). `res.error` gav en TYST retur: admin
+        // sag en tom dropdown, identiskt med det legitima laget "inga kunder annu".
+        if (res.error || !res.data) {
+          var o = document.createElement("option");
+          o.value = ""; o.disabled = true;
+          o.textContent = "— kundlistan kunde inte hämtas, ladda om sidan —";
+          sel.appendChild(o);
+          return;
+        }
         res.data.forEach(function (p) {
           var o = document.createElement("option");
           o.value = p.id;
@@ -2351,6 +2436,14 @@
     }
     sb.from("site_templates").select("*").eq("active", true).order("sort", { ascending: true }).then(function (res) {
       var sel = document.getElementById("b-template");
+      // 🔴 Samma sak for mallistan: vid fel visades bara "Generisk", vilket ser ut
+      // som "inga extra mallar aktiverade". Att bygga en kundsajt pa generisk nar
+      // kunden bestallt en restaurangsajt ar exakt felet studio-kit#2 lagar i
+      // andra anden - har sags det i stallet rakt ut.
+      if (sel && res.error) {
+        toast("Mallistan kunde inte hämtas: " + (res.error.message || "okänt fel") +
+              ". Endast Generisk visas — bygg inte förrän listan går att hämta.", true);
+      }
       if (sel && !res.error && res.data && res.data.length) {
         sel.innerHTML = res.data.map(function (t) { TEMPLATES[t.key] = t; return '<option value="' + esc(t.key) + '">' + esc(t.label) + "</option>"; }).join("");
         sel.addEventListener("change", renderExtra);
@@ -2737,9 +2830,19 @@
         sb.from("site_change_proposals").select("*").eq("user_id", pid).order("created_at"),
         sb.from("build_jobs").select("status, shared_at, preview_url, created_at").eq("customer_id", pid).order("created_at", { ascending: false })
       ]).then(function (out) {
-      var addons = out[0].data || [];
-      var done = {}, doneExtras = {}; (out[1].data || []).forEach(function (r) { done[r.step_no] = r.done_at; doneExtras[r.step_no] = r.with_extras; });
-      var requests = out[2].data || [];
+      // 🔴 RATTAT 2026-09-06 (#66, fynd 9). Sju av tio deltradar i den har
+      // Promise.all kontrollerade `out[n].error`; DE HAR TRE gjorde det inte.
+      // Ett fragefel sag darfor ut som "inga tillagg foreslagna", "inget steg
+      // avklarat" och "inga arenden annu" - och kunde fa en admin att missbedoma
+      // var kunden faktiskt star i sin resa. Nu samma monster som de sju.
+      var addons = out[0].error ? [] : (out[0].data || []);
+      var done = {}, doneExtras = {}; (out[1].error ? [] : (out[1].data || [])).forEach(function (r) { done[r.step_no] = r.done_at; doneExtras[r.step_no] = r.with_extras; });
+      var requests = out[2].error ? [] : (out[2].data || []);
+      // Om nagon av de tre foll ar bilden ofullstandig - sag det, i stallet for att
+      // visa tomma listor som ser ut som ett tomt men friskt lage.
+      if ((out[0] && out[0].error) || (out[1] && out[1].error) || (out[2] && out[2].error)) {
+        toast("Delar av kundbilden kunde inte hämtas (tillägg, avklarade steg eller ärenden). Det som visas kan vara ofullständigt.", true);
+      }
       var briefs = out[3].error ? [] : (out[3].data || []);
       var brief = briefs[0] || null;
       var content = {}; (out[4].error ? [] : (out[4].data || [])).forEach(function (r) { content[r.step_no] = r; });
