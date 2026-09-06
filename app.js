@@ -1472,6 +1472,19 @@
         });
         Array.prototype.forEach.call(g.querySelectorAll("[data-delimg]"), function (btn) {
           btn.addEventListener("click", function () {
+            // 🔴 TILLAGT 2026-09-06. Raderaknappen saknade forhandslagesvakten som
+            // uppladdningen i samma vy har. Det ar INTE kosmetiskt:
+            //
+            // storage-policyn for DELETE lyder
+            //   foldername[1] = auth.uid() OR is_admin()
+            // och i "visa som kund" ar sessionen fortfarande ADMINENS. `is_admin()`
+            // ar alltsa sant, och raderingen GAR IGENOM. En admin som tittar som
+            // kund kunde permanent radera kundens uppladdade bild - i ett lage vars
+            // hela syfte ar "du kan inte gora andringar som kunden".
+            //
+            // Uppmatt i pg_policies 2026-09-06. Skydd finns bara i granssnittet,
+            // sa det maste finnas HAR.
+            if (typeof previewBlocked === "function" && previewBlocked()) return;
             if (!window.confirm("Ta bort bilden?")) return;
             // 🔴 RATTAT 2026-09-06 (#66, fynd 6). Inget felläge kollades. Misslyckades
             // borttagningen renderades galleriet bara om - bilden lag kvar, utan ett ord
