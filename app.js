@@ -176,12 +176,21 @@
       // SYNKRONA fel. Avvisades `digest()` ASYNKRONT - ovanligt men mojligt, t.ex.
       // med ett blockerande tillagg - fyrade `.then()` i anroparna ALDRIG.
       //
-      // Foljden for kunden: godkann-knappen ar redan satt till disabled nar
-      // anropet gors, sa den blev PERMANENT GRA utan felmeddelande. Hon ser en
-      // klickad knapp som inte gor nagot och maste ladda om sidan for att forsta
-      // att nagot ar fel. Alla tre anropsstallena hade samma hal; darfor sitter
-      // fixen i funktionen och inte i tre kopior.
-      }).catch(function () {
+      // Foljden for kunden: i tva av tre anropsstallen ar godkann-knappen redan
+      // satt till disabled nar anropet gors, sa den blev PERMANENT GRA utan
+      // felmeddelande. Det tredje (approveUpdatedOffer) fyras av en kryssruta som i
+      // stallet blir staende ikryssad utan att nagot hander.
+      //
+      // ⚠️ En tidigare version av den har kommentaren skrev "alla tre" om den
+      // disablade knappen. Fel - hålet var gemensamt, symtomet inte.
+      // Darfor sitter fixen i funktionen och inte i tre kopior.
+      }).catch(function (e) {
+        // ⚠️ Fallbacken bytte en SYNLIG hangning mot en TYST falsk kontrollsumma pa
+        // ett juridiskt dokument - samma feltyp svepet ska ta bort. Att blockera
+        // godkannandet ar Fredriks beslut (k-20260906-01) och tas inte har, men
+        // TYSTNADEN ar inget beslut: den bort oavsett vad han svarar.
+        toast("Kontrollsumman för avtalet kunde inte beräknas i din webbläsare. Godkännandet registreras, men utan den — hör av dig till OakStride så noterar vi det.", true);
+        if (window.console && console.warn) console.warn("[oakstride] sha256:", e);
         return "nohash-" + str.length;
       });
     } catch (e) {
@@ -676,23 +685,27 @@
 
   function loadPricing() {
     return sb.from("pricing_settings").select("*").eq("id", 1).maybeSingle().then(function (r) {
+      // 🔴 RATTAT TVA GANGER. Forsta forsoket lade kontrollen i `.then(ok, FEL)`:s
+      // andra argument. Men en PostgREST-builder AVVISAR ALDRIG utan
+      // `throwOnError()` - den resolvar alltid med {data, error}, aven vid
+      // natverksfel. Den grenen kordes darfor aldrig, och buggen var oforandrad
+      // medan bade kommentaren och PR-texten pastod att den var lagad.
+      //
+      // Uppmatt av granskaren mot en onabar host: RESOLVED -> data=null,
+      // error=TypeError: fetch failed.
+      //
+      // 👉 Lardomen ar storre an raden: jag applicerade "kolla .error" som ett
+      // MONSTER utan att kontrollera VAR signalen dyker upp. Kontrollen hor hemma
+      // i success-handlern, dar svaret faktiskt landar.
+      if (!r || r.error || !r.data) {
+        toast("Kunde inte hämta aktuella priser — siffrorna kan vara inaktuella. Ladda om sidan innan du godkänner något.", true);
+        if (window.console && console.warn) console.warn("[oakstride] pricing_settings:", r && r.error);
+        return;
+      }
       if (r && r.data) {
         pricing = { site_price: Number(r.data.site_price), drift_month: Number(r.data.drift_month), rate_setup: Number(r.data.rate_setup), rate_change: Number(r.data.rate_change) };
         AGREEMENT = buildAgreement(pricing);
       }
-    }, function (e) {
-      // 🔴 RATTAT 2026-09-06 (issue #66, fynd 3). Har stod `function () {}` - en
-      // HELT TOM avslagshanterare. Gick hamtningen fel fortsatte sessionen med den
-      // hardkodade `pricing`-variabeln som global standard, och avtalstexten - det
-      // juridiskt bindande dokumentet - visade da de gamla siffrorna.
-      //
-      // Har admin hojt priserna sag den kunden aldrig hojningen, och ingenting i
-      // granssnittet skilde det fran en lyckad hamtning.
-      //
-      // Vi kan inte AVGORA om siffrorna ar aktuella utan svaret, sa vi sager det
-      // rakt ut i stallet for att lata som om vi vet.
-      toast("Kunde inte hämta aktuella priser — siffrorna nedan kan vara inaktuella. Ladda om sidan innan du godkänner något.", true);
-      if (window.console && console.warn) console.warn("[oakstride] pricing_settings kunde inte hämtas:", e);
     });
   }
 
@@ -1463,7 +1476,15 @@
             // 🔴 RATTAT 2026-09-06 (#66, fynd 6). Inget felläge kollades. Misslyckades
             // borttagningen renderades galleriet bara om - bilden lag kvar, utan ett ord
             // om varfor "Ta bort" inte gjorde nagot. Kunden klickar da igen, och igen.
+            // ⚠️ `remove()` returnerar {data: [raderade objekt], error: null}. RLS pa
+            // storage ar en `using`-policy, alltsa ETT FILTER: blockeras raderingen
+            // far man `data: []` och inget fel. Att bara kolla `error` hade lamnat
+            // exakt symtomet kommentaren sager sig laga.
             bucket.remove([btn.getAttribute("data-delimg")]).then(function (res) {
+              if (res && !res.error && !(res.data && res.data.length)) {
+                toast("Bilden kunde inte tas bort — den ligger kvar. Kontakta OakStride om det upprepas.", true);
+                return;
+              }
               if (res && res.error) {
                 toast("Bilden kunde inte tas bort: " + (res.error.message || "okänt fel") + ". Den ligger kvar.", true);
                 return;
@@ -2124,8 +2145,21 @@
       if (btnApprove) {
         btnApprove.addEventListener("click", function () {
           btnApprove.disabled = true;
-          sb.from("requests").update({ status: "approved" }).eq("id", id).then(function (res) {
+          // 🔴 TILLAGT efter granskning. PR:en skrev sjalv fjorton rader ned att en
+          // USING-filtrerad update inte felar - och lamnade den mest kundnara
+          // uppdateringen orord. Har racker dessutom INTE radrakning:
+          // `protect_request_cols` (migration-2) ar en BEFORE UPDATE-trigger som for
+          // en icke-admin gor `new := old` nar status inte ar draft_ready. Da
+          // LYCKAS uppdateringen, traffar 1 rad, ger inget fel - och ingenting
+          // andrades. Enda satt att veta ar att LASA TILLBAKA statusen.
+          sb.from("requests").update({ status: "approved" }).eq("id", id).select("status").then(function (res) {
             if (res.error) { toast("Kunde inte godkänna: " + res.error.message, true); btnApprove.disabled = false; return; }
+            var nyStatus = (res.data && res.data[0]) ? res.data[0].status : null;
+            if (nyStatus !== "approved") {
+              toast("Godkännandet gick inte igenom — ärendet står kvar som " +
+                    (nyStatus || "oförändrat") + ". Ladda om sidan och försök igen.", true);
+              btnApprove.disabled = false; return;
+            }
             toast("Tack! Förslaget är godkänt — vi publicerar inom kort.");
             renderDetail(id, isAdmin);
           });
@@ -2840,8 +2874,13 @@
       var requests = out[2].error ? [] : (out[2].data || []);
       // Om nagon av de tre foll ar bilden ofullstandig - sag det, i stallet for att
       // visa tomma listor som ser ut som ett tomt men friskt lage.
-      if ((out[0] && out[0].error) || (out[1] && out[1].error) || (out[2] && out[2].error)) {
-        toast("Delar av kundbilden kunde inte hämtas (tillägg, avklarade steg eller ärenden). Det som visas kan vara ofullständigt.", true);
+      // ⚠️ UTOKAT efter granskning. Forsta versionen tackte bara de tre tradar jag
+      // ROR - men foll `out[3]` (project_briefs) blev brief null, step1Done falskt,
+      // och admin sag "steg 1 inte klart" utan ett ord. Sju av tio hade alltsa kvar
+      // exakt den felbedomning kommentaren varnar for. Tacket galler nu alla tio.
+      var falladeTradar = out.filter(function (o) { return o && o.error; }).length;
+      if (falladeTradar) {
+        toast(falladeTradar + " av " + out.length + " delar av kundbilden kunde inte hämtas. Det som visas är OFULLSTÄNDIGT — ladda om innan du drar slutsatser om var kunden står.", true);
       }
       var briefs = out[3].error ? [] : (out[3].data || []);
       var brief = briefs[0] || null;
