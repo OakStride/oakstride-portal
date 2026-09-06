@@ -232,6 +232,18 @@
   //
   // Vi kan bara uttala oss om en rad vi SJALVA skrev. Skrevs ingen: sag inget om
   // kontrollsumman - varningen gavs vid det tillfalle raden faktiskt skrevs.
+  //
+  // ⚠️ Den sista meningen galler bara om det inte redan LIGGER rader utan
+  // kontrollsumma i drift - sadana skrevs av kod som antingen inte varnade alls
+  // eller varnade i en toast som skrevs over. For dem skulle 23505-vagen tiga for
+  // alltid. Darfor ar den matt och inte antagen, 2026-09-06:
+  //
+  //   select count(*) filter (where document_hash like 'nohash-%') ... -> 0 av 1 rad
+  //
+  // Noll. Resonemanget ar alltsa belagt i dag. Blir det nagon gang mer an noll ar
+  // koden fortfarande ratt, men da finns kunder vars godkannande saknar
+  // kontrollsumma utan att portalen sager det - och det ar ett eget arende till
+  // Fredrik, skilt fran k-20260906-01 som handlar om att blockera framat.
   function hashNotis(res, hash) {
     var skrevs = !(res && res.error);       // 23505 = fanns redan, inget skrevs
     return (skrevs && hashSaknas(hash)) ? HASH_NOTIS : "";
@@ -818,6 +830,13 @@
     });
   }
 
+  // 🚧 ANROPAS INTE FRAN NAGOT HALL - samma sak som acceptTerms ovan, och
+  // markt av samma skal. Granskningen pekade pa att markera det ena men inte det
+  // andra ger markeringen fel innebord: nasta lasare drar da slutsatsen att en
+  // OMARKT funktion ar levande. Kontrollerat 2026-09-06, en enda forekomst i repot.
+  //
+  // Den har ar dessutom den farligaste av de tva att missta for levande kod - den
+  // ser ut som villkorsvyns ingang och ror `custAgreement`.
   function renderTermsView(back) {
     main.innerHTML =
       '<button class="back-link" id="btn-back">&larr; Tillbaka</button>' +
