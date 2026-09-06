@@ -205,7 +205,7 @@
     } catch (e) {
       // ⚠️ Den SYNKRONA grenen (crypto.subtle saknas helt) hade kvar tystnaden
       // aven efter forsta rattningen - granskarens fynd B. Den delar nu markor och
-      // console.warn med den asynkrona, sa `hashSaknas()` nedan fangar bada.
+      // console.warn med den asynkrona, sa `kontrollsummaOk()` nedan fangar bada.
       if (window.console && console.warn) console.warn("[oakstride] sha256 (synkront):", e);
       return Promise.resolve("nohash-" + str.length);
     }
@@ -214,8 +214,18 @@
   // Markoren fran sha256Hex fallback. Bada grenarna returnerar "nohash-<längd>", sa
   // anroparen kan se att dokumentets kontrollsumma ar en platshallare - utan nagon
   // delad flagga. Kvittotexten sager det i stallet for att latsas om saken.
-  function hashSaknas(hash) {
-    return typeof hash === "string" && hash.indexOf("nohash-") === 0;
+  // 🔴 RATTAT efter granskning av #69. Har stod en NEGATIV kontroll:
+  // `hash.indexOf("nohash-") === 0`, alltsa bunden till en magisk strang som satts
+  // pa tva andra stallen i sha256Hex. Andrar nagon markoren i den ena grenen blir
+  // vakten blind for just den grenen, och ingenting i repot gar rott - portalen har
+  // inga prov.
+  //
+  // Den positiva formen svarar pa den fraga vi faktiskt staller: ar det har en
+  // riktig SHA-256? Den blockerar oberoende av markoren, och den fangar dessutom
+  // allt som inte ar en strang (undefined, null, 0, objekt) - onabart i dag, men
+  // "kan inte skrivas" blir strukturellt sant i stallet for konventionellt sant.
+  function kontrollsummaOk(hash) {
+    return typeof hash === "string" && /^[0-9a-f]{64}$/.test(hash);
   }
   // 🔴 FREDRIKS BESLUT, kort k-20260906-01, ordagrant: "Blockera
   // godkannandet om kontrollsumman inte kan beraknas".
@@ -227,8 +237,32 @@
   //
   // Anropas FORE varje insert mot agreement_acceptances. Returnerar true om
   // anroparen ska avbryta.
-  function blockeraUtanKontrollsumma(hash, aterstall) {
-    if (!hashSaknas(hash)) return false;
+  // 🔴 RATTAT efter granskning av #69 - och det ar tredje gangen samma
+  // lardom i den har filen. Forsta versionen la varningen i en gren som aldrig kors.
+  // Andra la den i en toast som skrevs over av FRAMGANGEN. Den har la den i en toast
+  // som skrevs over av KLOCKAN: 256 tecken som slacker sig sjalv efter 3500 ms, och
+  // bada aterstallningsvagarna raderar samtidigt varje spar av att nagot hant. Efter
+  // fyra sekunder var skarmen tecken for tecken identisk med "kunden gjorde
+  // ingenting" - i ett lage som ar DETERMINISTISKT for hennes webblasare, sa hon far
+  // samma tomma skarm hur manga ganger hon an forsoker.
+  //
+  // Nu skrivs beskedet ocksa i en BESTANDIG yta (`status-note error`), samma monster
+  // som filen redan anvander pa nio stallen. Toasten star kvar for den som tittar
+  // just da; ytan star kvar for den som tittade bort.
+  //
+  // ⚠️ Vad detta INTE loser: OakStride far fortfarande inget besked. Vid blockering
+  // skrivs ingen rad, sa `notify_agreement_accepted` fyrar inte, och nagon annan
+  // larmvag finns inte. Kunden ar alltsa den enda som vet - och hon ombeds hora av
+  // sig. Att bygga en serverside-larmvag ar ett eget beslut (Fredrik sa 2026-09-06,
+  // om en annan kanal: "bygg ingen ny kanal"), och det ska inte smygas in har.
+  function blockeraUtanKontrollsumma(hash, aterstall, notisId) {
+    if (kontrollsummaOk(hash)) return false;
+    var n = notisId ? document.getElementById(notisId) : null;
+    if (n) {
+      n.hidden = false;
+      n.className = "status-note error";
+      n.textContent = "Godkännandet gick INTE igenom. Din webbläsare kunde inte beräkna den kontrollsumma som avtalet kräver, och vi registrerar hellre ingenting än ett godkännande som saknar den. Prova en annan webbläsare, eller hör av dig till OakStride så löser vi det åt dig.";
+    }
     toast("Godkännandet gick INTE igenom. Din webbläsare kunde inte beräkna den kontrollsumma som avtalet kräver, och vi registrerar hellre ingenting än ett godkännande som saknar den. Prova en annan webbläsare, eller hör av dig till OakStride så löser vi det åt dig.", true);
     if (window.console && console.warn) console.warn("[oakstride] godkannande blockerat: kontrollsumman kunde inte beraknas");
     if (typeof aterstall === "function") aterstall();
@@ -244,7 +278,9 @@
   // REDAN ligger i drift med en attrapp far inget besked den har vagen. Matt
   // 2026-09-06: noll sadana rader (0 av 1).
   //
-  // (Gammal kommentar, bevarad for sammanhang:) `hashSaknas(hash)` ensam ar FEL
+  // (Gammal kommentar, bevarad for sammanhang. `hashSaknas` finns inte langre -
+  // den ersattes av den positiva `kontrollsummaOk` ovan. Resonemanget galler an:)
+  // markoren ensam ar FEL
   // signal i kvittot: den laser klientens nyberaknade hash, och enda vagen som inte
   // returnerar tidigt ar 23505 - alltsa "raden fanns redan, INGENTING skrevs".
   // agreement_acceptances har unique (user_id, agreement_version), sa 23505 ar inte
@@ -834,7 +870,9 @@
   function acceptTerms(btn) {
     btn.disabled = true;
     sha256Hex(custAgreement.version + "\n" + custAgreement.html).then(function (hash) {
-      if (blockeraUtanKontrollsumma(hash, function () { btn.disabled = false; })) return;
+      // `agree-status` ar villkorsvyns egen bestandiga yta - samma element som
+      // felgrenen tva rader ned redan skriver i.
+      if (blockeraUtanKontrollsumma(hash, function () { btn.disabled = false; }, "agree-status")) return;
       sb.from("agreement_acceptances").insert({
         user_id: cuid(),
         agreement_version: custAgreement.version,
@@ -1826,7 +1864,8 @@
                 clarFormHtml() +
                 '<label class="agree-check"><input type="checkbox" id="agree-cb"> <span>Jag har läst och godkänner kravspecifikationen/offerten (v' + spec.version + ") och OakStrides kundvillkor (version " + esc(custAgreement.version) + ").</span></label>" +
                 billingFormHtml(billing) +
-                '<button id="btn-approve-offer" class="btn btn-primary btn-inline" disabled>Godkänn offert &amp; villkor</button>';
+                '<button id="btn-approve-offer" class="btn btn-primary btn-inline" disabled>Godkänn offert &amp; villkor</button>' +
+                '<p id="hash-status-offert" class="status-note" hidden></p>';
             } else {
               body += '<p class="muted">Blir aktivt när föregående steg är klart.</p>';
             }
@@ -1862,7 +1901,8 @@
                 body += '<p class="muted">Vi har uppdaterat kravspecifikationen &amp; offerten utifrån dina önskemål. Godkänn den nya versionen innan lansering:</p>' +
                   '<div class="onb-offer4"><h4>Uppdaterad kravspecifikation &amp; offert (v' + spec.version + ")</h4>" +
                   '<div class="onb-docs"><button type="button" class="btn btn-ghost btn-sm js-open-spec">Öppna kravspecifikation &amp; offert &#8599;</button></div>' +
-                  '<label class="onb-confirm"><input type="checkbox" data-approve-offer4="' + spec.version + '"> <span>Jag godkänner den uppdaterade kravspecifikationen och offerten (v' + spec.version + ")</span></label></div>";
+                  '<label class="onb-confirm"><input type="checkbox" data-approve-offer4="' + spec.version + '"> <span>Jag godkänner den uppdaterade kravspecifikationen och offerten (v' + spec.version + ")</span></label>" +
+                  '<p id="hash-status-uppdaterad" class="status-note" hidden></p></div>';
               }
               if (done[5]) {
                 body += '<p class="onb-verified">✓ Du har godkänt sidan — vi lanserar den inom kort och meddelar dig.</p>';
@@ -1927,7 +1967,7 @@
       if (blockeraUtanKontrollsumma(hash, function () {
             var ruta = document.querySelector("[data-approve-offer4]");
             if (ruta) ruta.checked = false;
-          })) return;
+          }, "hash-status-uppdaterad")) return;
       sb.from("agreement_acceptances").insert({
         user_id: cuid(), agreement_version: custAgreement.version, document_title: custAgreement.title,
         document_hash: hash, user_agent: navigator.userAgent, order_summary: summary
@@ -1973,7 +2013,7 @@
         // 🔴 Faktureringsuppgifterna ar redan sparade har (upserten ovan).
         // Det ar med flit: de ar kundens egna uppgifter och ska inte kastas bort for
         // att kontrollsumman felade. Det som INTE skrivs ar godkannandet.
-        if (blockeraUtanKontrollsumma(hash, function () { btn.disabled = false; })) return;
+        if (blockeraUtanKontrollsumma(hash, function () { btn.disabled = false; }, "hash-status-offert")) return;
         sb.from("agreement_acceptances").insert({
           user_id: cuid(), agreement_version: custAgreement.version, document_title: custAgreement.title,
           document_hash: hash, user_agent: navigator.userAgent, order_summary: summary
