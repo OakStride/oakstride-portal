@@ -929,6 +929,7 @@
       // TypeError inuti en .then() utan .catch - da star spinnern kvar for evigt
       // utan felkort. Gamla koden degraderade i stallet till tomt formular.
       var b = (res && res.data) ? res.data : {};
+      var hadeRad = !!(res && res.data);
       function f(id, label, val, ph, type) { return '<label for="' + id + '">' + esc(label) + '</label><input type="' + (type || "text") + '" id="' + id + '" value="' + esc(val || "") + '"' + (ph ? ' placeholder="' + esc(ph) + '"' : "") + ">"; }
       main.innerHTML =
         '<button class="back-link" id="btn-acc-back">&larr; Tillbaka</button>' +
@@ -957,10 +958,28 @@
         function v(id) { var el = document.getElementById(id); return el ? (el.value || "").trim() : ""; }
         var newName = v("acc-name") || null, newCompany = v("acc-company") || null, newEmail = v("acc-email");
         var bill = { user_id: session.user.id, company: v("bill-company") || null, org_nr: v("bill-org") || null, address: v("bill-addr") || null, postal_city: v("bill-postcity") || null, invoice_email: v("bill-email") || null, reference: v("bill-ref") || null, updated_at: new Date().toISOString() };
-        Promise.all([
-          sb.from("profiles").update({ full_name: newName, company: newCompany }).eq("id", session.user.id),
-          sb.from("billing_details").upsert(bill)
-        ]).then(function (rs) {
+
+        // 🔴 SPARR mot att skriva over en DOLD rad. Felgrenen ovan fangar bara
+        // felobjekt. En RLS-filtrering eller en utgangen session ger 0 rader UTAN
+        // fel - matt i drift 2026-09-06 - och da renderas ett tomt formular for en
+        // kund som HAR uppgifter.
+        //
+        // Regeln: renderades formularet utan rad, OCH skickas det med alla
+        // faktureringsfalt tomma, sa finns det ingenting att spara. Skriv da inte.
+        //
+        // Det raddar scenariot som gav upphov till hela fixen: kunden oppnar
+        // "Mina uppgifter" for att byta sitt telefonnummer och sparar.
+        //
+        // ⚠️ Det raddar INTE en kund som fyller i NAGOT faktureringsfalt medan
+        // raden ar dold - da skrivs det ifyllda plus null for resten. Men da anger
+        // kunden aktivt faktureringsdata, vilket ar en annan handling an att spara
+        // ett orort formular. Skriv inte om det har till att halet ar stangt.
+        var tomFaktura = !bill.company && !bill.org_nr && !bill.address &&
+                         !bill.postal_city && !bill.invoice_email && !bill.reference;
+        var skrivningar = [sb.from("profiles").update({ full_name: newName, company: newCompany }).eq("id", session.user.id)];
+        if (hadeRad || !tomFaktura) skrivningar.push(sb.from("billing_details").upsert(bill));
+
+        Promise.all(skrivningar).then(function (rs) {
           var err = (rs[0] && rs[0].error) || (rs[1] && rs[1].error);
           if (err) { note.hidden = false; note.className = "status-note error"; note.textContent = "Kunde inte spara: " + err.message; return; }
           profile.full_name = newName; profile.company = newCompany;
