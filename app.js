@@ -886,7 +886,58 @@
     show("app");
     main.innerHTML = '<div class="spinner"></div>';
     sb.from("billing_details").select("*").eq("user_id", session.user.id).maybeSingle().then(function (res) {
+      // 🔴 RATTAT 2026-09-06 (tystnadssvep). `res.error` lastes aldrig har.
+      //
+      // Misslyckades hamtningen blev `b = {}` och formuläret renderades TOMT -
+      // identiskt med "kunden har aldrig fyllt i nagot". Sparade kunden da, for
+      // att byta sitt telefonnummer, skrevs org.nr, fakturaadress och fakturamejl
+      // over med null. Tyst forlust av det vi fakturerar pa.
+      //
+      // ⚠️ Det som gor felet svart att se: `maybeSingle()` ger `data = null,
+      // error = null` for en kund UTAN rad. Ett tomt formular ar alltsa helt
+      // riktigt for en ny kund.
+      //
+      // 🔴 OCH DEN HAR KONTROLLEN RACKER INTE HELA VAGEN. En tidigare version av
+      // den har kommentaren pastod att "det ENDA som skiljer lagena at ar error".
+      // Det ar FALSKT, uppmatt i drift 2026-09-06: en `authenticated` som inte
+      // ager raden far **0 rader och inget fel** - en USING-policy FILTRERAR, den
+      // kastar inte.
+      //
+      //   ✅ natverksfel och 401  -> felobjekt, fangas nedan
+      //   ❌ RLS-filtrering        -> 0 rader, inget fel, STAR KVAR
+      //
+      // ⚠️ En tidigare version skrev "samma sak vid en utgangen session". Det ar
+      // INTE matt och hangdes pa en matning som inte omfattar det: en utgangen JWT
+      // avvisas av PostgREST FORE policyn, med 401 och ett felobjekt - alltsa
+      // felgrenen. Pastaendet kan stamma for en MISSLYCKAD refresh dar begaran gar
+      // som anon, men det har varken jag eller granskaren matt. Sag det inte igen
+      // utan att mata: skicka en begaran med (a) utgangen anvandar-JWT och (b)
+      // enbart anon-nyckeln, och jamfor status och error.
+      //
+      // Den kvarvarande vagen kraver ett annat grepp (verifiera sessionen, eller
+      // gora upserten icke-destruktiv) och ligger som eget fynd i issue #66.
+      // Skriv inte om det har stycket till nagot lugnare utan att mata om.
+      //
+      // Fixen ar inte att validera vid submit - en kund ska kunna tomma ett falt.
+      // Fixen ar att aldrig visa ett formular byggt pa data vi inte fick.
+      if (res && res.error) {
+        main.innerHTML =
+          '<button class="back-link" id="btn-acc-back">&larr; Tillbaka</button>' +
+          '<div class="card" style="max-width:600px"><h1>Mina uppgifter</h1>' +
+          '<p class="status-note error">Dina uppgifter kunde inte hämtas just nu: ' + esc(res.error.message) + '</p>' +
+          '<p class="muted">Formuläret visas inte, eftersom ett tomt formulär hade kunnat spara över dina faktureringsuppgifter. Ingenting har ändrats.</p>' +
+          '<button class="btn btn-primary btn-inline" id="btn-acc-retry">Försök igen</button></div>';
+        document.getElementById("btn-acc-back").addEventListener("click", function () {
+          if (profile.is_admin && !viewAsCustomer) renderAdmin(); else renderCustomer();
+        });
+        document.getElementById("btn-acc-retry").addEventListener("click", renderAccount);
+        return;
+      }
+      // `res &&` behalls: felgrenen ovan har den, och utan den kastar raden
+      // TypeError inuti en .then() utan .catch - da star spinnern kvar for evigt
+      // utan felkort. Gamla koden degraderade i stallet till tomt formular.
       var b = (res && res.data) ? res.data : {};
+      var hadeRad = !!(res && res.data);
       function f(id, label, val, ph, type) { return '<label for="' + id + '">' + esc(label) + '</label><input type="' + (type || "text") + '" id="' + id + '" value="' + esc(val || "") + '"' + (ph ? ' placeholder="' + esc(ph) + '"' : "") + ">"; }
       main.innerHTML =
         '<button class="back-link" id="btn-acc-back">&larr; Tillbaka</button>' +
@@ -915,12 +966,87 @@
         function v(id) { var el = document.getElementById(id); return el ? (el.value || "").trim() : ""; }
         var newName = v("acc-name") || null, newCompany = v("acc-company") || null, newEmail = v("acc-email");
         var bill = { user_id: session.user.id, company: v("bill-company") || null, org_nr: v("bill-org") || null, address: v("bill-addr") || null, postal_city: v("bill-postcity") || null, invoice_email: v("bill-email") || null, reference: v("bill-ref") || null, updated_at: new Date().toISOString() };
-        Promise.all([
-          sb.from("profiles").update({ full_name: newName, company: newCompany }).eq("id", session.user.id),
-          sb.from("billing_details").upsert(bill)
-        ]).then(function (rs) {
+
+        // 🔴 SPARR mot att skriva over en DOLD rad. Felgrenen ovan fangar bara
+        // felobjekt. En RLS-filtrering eller en utgangen session ger 0 rader UTAN
+        // fel - matt i drift 2026-09-06 - och da renderas ett tomt formular for en
+        // kund som HAR uppgifter.
+        //
+        // Regeln: renderades formularet utan rad, OCH skickas det med alla
+        // faktureringsfalt tomma, sa finns det ingenting att spara. Skriv da inte.
+        //
+        // Det raddar scenariot som gav upphov till hela fixen: kunden oppnar
+        // "Mina uppgifter" for att byta sitt telefonnummer och sparar.
+        //
+        // ⚠️ Det raddar INTE en kund som fyller i NAGOT faktureringsfalt medan
+        // raden ar dold - da skrivs det ifyllda plus null for resten. Men da anger
+        // kunden aktivt faktureringsdata, vilket ar en annan handling an att spara
+        // ett orort formular. Skriv inte om det har till att halet ar stangt.
+        //
+        // 🔴 OCH DET VIKTIGASTE SPARREN INTE RACKER TILL: profiles-uppdateringen
+        // tre rader ned lyder under SAMMA sorts USING-policy. Uppmatt i drift
+        // 2026-09-06: en update under fel uid traffar **0 rader och ger inget fel**.
+        //
+        // I exakt det scenario den har sparren ar byggd for - raden dold - skrivs
+        // alltsa inte heller kundens NAMNBYTE, och hon far anda "Uppgifterna ar
+        // sparade". Portalen satter dessutom profile.full_name lokalt, sa UI:t
+        // visar det nya vardet tills sidan laddas om.
+        //
+        // Det ar inte en regression - meddelandet fanns fore sparren. Men sparren
+        // gor scenariot till ett erkant driftlage, och da hor det tysta no-op:et
+        // hemma i samma kommentar. Ett update som ger noll rader betyder att
+        // ingenting andrades, aldrig att det gick bra. Eget fynd i issue #66.
+        //
+        // 📌 Sidoeffekt, kontrollerad och ofarlig: for en AKTA ny kund som lamnar
+        // fakturafalten tomma skapas nu ingen tom rad alls (forut skapades en med
+        // idel null). Bada konsumenterna tal det - bada anvander maybeSingle eller
+        // en null-vakt, och approveOffer kraver anda ifyllda falt.
+        var tomFaktura = !bill.company && !bill.org_nr && !bill.address &&
+                         !bill.postal_city && !bill.invoice_email && !bill.reference;
+        // `.select("id")` sa vi far tillbaka de rader som FAKTISKT skrevs. Utan den
+        // kan vi bara se om anropet felade - och en USING-filtrerad update felar inte,
+        // den traffar noll rader. Se rakningen i .then() nedan.
+        //
+        // ⚠️ Varfor bara HAR och inte pa upserten: billing_details-policyn har en
+        // `with check`-halva, och en skrivning under fel uid avvisas darfor med 42501
+        // i stallet for att tyst traffa noll rader. Uppmatt 2026-09-06. Far tabellen
+        // nagon gang en policy dar en USING-halva kan filtrera utan att `with check`
+        // fyrar, ar halet tillbaka och tyst - lagg da `.select()` har ocksa.
+        var skrivningar = [sb.from("profiles").update({ full_name: newName, company: newCompany }).eq("id", session.user.id).select("id")];
+        if (hadeRad || !tomFaktura) skrivningar.push(sb.from("billing_details").upsert(bill));
+
+        Promise.all(skrivningar).then(function (rs) {
           var err = (rs[0] && rs[0].error) || (rs[1] && rs[1].error);
           if (err) { note.hidden = false; note.className = "status-note error"; note.textContent = "Kunde inte spara: " + err.message; return; }
+
+          // 🔴 RATTAT 2026-09-06 efter granskning. Har stod tidigare bara felkollen
+          // ovan, och sedan "Uppgifterna ar sparade".
+          //
+          // Uppmatt i drift: en update som RLS filtrerar bort traffar **0 rader och
+          // ger inget fel**. Kunden fick alltsa ett gront kvitto for en sparning som
+          // aldrig skedde. Sparren ovan gjorde det VARRE: utan den avvisades
+          // upserten med 42501 (`with check`) och kunden fick atminstone ett rott
+          // felmeddelande. Med sparren hoppades den over, och da fanns ingenting
+          // kvar som kunde fela.
+          //
+          // Nu raknas raderna i stallet. Noll rader betyder att ingenting andrades,
+          // aldrig att det gick bra - globala principernas regel, rakt av.
+          var skrivna = (rs[0] && rs[0].data) ? rs[0].data.length : 0;
+          if (!skrivna) {
+            note.hidden = false; note.className = "status-note error";
+            // ⚠️ Sag bara det koden VET: data.length === 0, alltsa att ingenting
+            // skrevs. Orsaken kan vara RLS-filtrering, en saknad profiles-rad eller
+            // ett id som inte matchar - koden kan inte skilja dem at, och en utpekad
+            // orsak skickar bade kunden och supporten at fel hall.
+            //
+            // 🔴 Och lova inte att inmatningen overlever. En tidigare version sa
+            // "logga ut och in, sa forsvinner inget av det du fyllt i har". Det ar
+            // FALSKT: formularet renderas om fran databasen och allt hon skrivit ar
+            // borta. I en fix vars hela syfte ar att sluta ge falska besked var det
+            // den samsta tankbara meningen.
+            note.textContent = "Ingenting sparades — ändringen gick inte igenom. Det du skrivit står kvar i fälten, så prova Spara igen. Hjälper inte det: skriv av uppgifterna först, logga sedan ut och in — fälten töms när sidan laddas om.";
+            return;
+          }
           profile.full_name = newName; profile.company = newCompany;
           if (newEmail && newEmail !== profile.email) {
             sb.auth.updateUser({ email: newEmail }).then(function (er) {
