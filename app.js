@@ -189,14 +189,35 @@
         // ett juridiskt dokument - samma feltyp svepet ska ta bort. Att blockera
         // godkannandet ar Fredriks beslut (k-20260906-01) och tas inte har, men
         // TYSTNADEN ar inget beslut: den bort oavsett vad han svarar.
-        toast("Kontrollsumman för avtalet kunde inte beräknas i din webbläsare. Godkännandet registreras, men utan den — hör av dig till OakStride så noterar vi det.", true);
+        //
+        // 🔴 RATTAT TVA GANGER. Forsta forsoket toastade harifran. Granskaren matte
+        // att den toasten ALLTID skrivs over: alla tre anropsstallen fortsatter till en
+        // insert som pa lyckad vag toastar "Tack!", och `toast()` har ETT element och EN
+        // delad timer. Efter en round-trip var varningen borta - alltsa exakt den
+        // tystnad raderna ovan sager sig ta bort.
+        //
+        // 👉 Samma monsterfel som i loadPricing, en niva upp: jag valde en KANAL
+        // utan att kontrollera var den landar. Varningen hor hemma i kvittot kunden
+        // laser, inte i en ruta som kvittot skriver over 200 ms senare.
         if (window.console && console.warn) console.warn("[oakstride] sha256:", e);
         return "nohash-" + str.length;
       });
     } catch (e) {
+      // ⚠️ Den SYNKRONA grenen (crypto.subtle saknas helt) hade kvar tystnaden
+      // aven efter forsta rattningen - granskarens fynd B. Den delar nu markor och
+      // console.warn med den asynkrona, sa `hashSaknas()` nedan fangar bada.
+      if (window.console && console.warn) console.warn("[oakstride] sha256 (synkront):", e);
       return Promise.resolve("nohash-" + str.length);
     }
   }
+
+  // Markoren fran sha256Hex fallback. Bada grenarna returnerar "nohash-<längd>", sa
+  // anroparen kan se att dokumentets kontrollsumma ar en platshallare - utan nagon
+  // delad flagga. Kvittotexten sager det i stallet for att latsas om saken.
+  function hashSaknas(hash) {
+    return typeof hash === "string" && hash.indexOf("nohash-") === 0;
+  }
+  var HASH_NOTIS = " OBS: kontrollsumman för avtalet kunde inte beräknas i din webbläsare, så godkännandet saknar den. Hör av dig till OakStride så noterar vi det.";
 
   // 5-stegsflödet. form: steg 1 klart via projektförfrågan. offer: steg 3 = godkänn
   // kravspec/offert + villkor + faktureringsuppgifter. site: steg 4 = godkänn sida & konfig.
@@ -702,10 +723,8 @@
         if (window.console && console.warn) console.warn("[oakstride] pricing_settings:", r && r.error);
         return;
       }
-      if (r && r.data) {
-        pricing = { site_price: Number(r.data.site_price), drift_month: Number(r.data.drift_month), rate_setup: Number(r.data.rate_setup), rate_change: Number(r.data.rate_change) };
-        AGREEMENT = buildAgreement(pricing);
-      }
+      pricing = { site_price: Number(r.data.site_price), drift_month: Number(r.data.drift_month), rate_setup: Number(r.data.rate_setup), rate_change: Number(r.data.rate_change) };
+      AGREEMENT = buildAgreement(pricing);
     });
   }
 
@@ -762,7 +781,7 @@
           if (n) { n.hidden = false; n.className = "status-note error"; n.textContent = "Kunde inte spara: " + res.error.message; }
           btn.disabled = false; return;
         }
-        toast("Tack! Villkoren är godkända.");
+        toast("Tack! Villkoren är godkända." + (hashSaknas(hash) ? HASH_NOTIS : ""), hashSaknas(hash));
         loadOnboarding();
       });
     });
@@ -1814,7 +1833,8 @@
       }).then(function (r2) {
         if (r2.error && r2.error.code !== "23505") { toast("Kunde inte spara: " + r2.error.message, true); return; }
         sb.from("extra_work_approvals").insert({ user_id: cuid(), spec_version: spec.version }).then(function () {
-          toast("Tack! Den uppdaterade offerten är godkänd — en ny orderbekräftelse skickas.");
+          toast("Tack! Den uppdaterade offerten är godkänd — en ny orderbekräftelse skickas." +
+                (hashSaknas(hash) ? HASH_NOTIS : ""), hashSaknas(hash));
           loadOnboarding();
         });
       });
@@ -1839,7 +1859,8 @@
         }).then(function (r2) {
           if (r2.error && r2.error.code !== "23505") { toast("Kunde inte spara godkännande: " + r2.error.message, true); btn.disabled = false; return; }
           sb.from("extra_work_approvals").insert({ user_id: cuid(), spec_version: spec.version }).then(function () {
-            toast("Tack! Offert och villkor godkända — en orderbekräftelse skickas till din e-post.");
+            toast("Tack! Offert och villkor godkända — en orderbekräftelse skickas till din e-post." +
+                  (hashSaknas(hash) ? HASH_NOTIS : ""), hashSaknas(hash));
             loadOnboarding();
           });
         });
@@ -2169,8 +2190,11 @@
             if (res.error) { toast("Kunde inte godkänna: " + res.error.message, true); btnApprove.disabled = false; return; }
             var nyStatus = (res.data && res.data[0]) ? res.data[0].status : null;
             if (nyStatus !== "approved") {
+              // `labels` ar STATUS_LABELS for kunden - utan den skrevs den rana
+              // enum-koden ut i kundvand text ("waiting_customer").
               toast("Godkännandet gick inte igenom — ärendet står kvar som " +
-                    (nyStatus || "oförändrat") + ". Ladda om sidan och försök igen.", true);
+                    (nyStatus ? (labels[nyStatus] || nyStatus) : "oförändrat") +
+                    ". Ladda om sidan och försök igen.", true);
               btnApprove.disabled = false; return;
             }
             toast("Tack! Förslaget är godkänt — vi publicerar inom kort.");
@@ -2208,8 +2232,17 @@
 
       if (isAdmin) {
         document.getElementById("d-status").addEventListener("change", function (e) {
-          sb.from("requests").update({ status: e.target.value }).eq("id", id).then(function (res) {
-            if (res.error) toast("Kunde inte uppdatera status: " + res.error.message, true);
+          // 🔴 RATTAT efter granskning (fynd C). Har lag samma konstruktion som
+          // jag just lagade tjugo rader ovanfor: policyn "requests: admin uppdaterar"
+          // ar `for update using (is_admin())`, alltsa ETT FILTER. Returnerar
+          // is_admin() falskt (profilraden saknas, flaggan avslagen) traffas noll rader
+          // utan fel - och admin far "Status uppdaterad." Lagre insats an kundens
+          // knapp, men samma rad i samma funktion: monstret dar rattelsen bara nadde
+          // ett av stallena.
+          sb.from("requests").update({ status: e.target.value }).eq("id", id).select("id").then(function (res) {
+            var skrivna = (res && res.data) ? res.data.length : 0;
+            if (res && res.error) toast("Kunde inte uppdatera status: " + res.error.message, true);
+            else if (!skrivna) toast("Statusen ändrades inte — ingen rad uppdaterades. Ladda om sidan och kontrollera att du fortfarande är inloggad som admin.", true);
             else toast("Status uppdaterad.");
           });
         });
