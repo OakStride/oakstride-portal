@@ -217,7 +217,34 @@
   function hashSaknas(hash) {
     return typeof hash === "string" && hash.indexOf("nohash-") === 0;
   }
-  // 🔴 TILLAGT efter granskningens omgang 3. `hashSaknas(hash)` ensam ar FEL
+  // 🔴 FREDRIKS BESLUT, kort k-20260906-01, ordagrant: "Blockera
+  // godkannandet om kontrollsumman inte kan beraknas".
+  //
+  // Avtalet lovar kunden en SHA-256-kontrollsumma av villkorstexten (se
+  // buildAgreement). Kunde den inte beraknas skrev koden forut en attrapp och lat
+  // godkannandet ga igenom anda - en rad i agreement_acceptances som inte uppfyller
+  // det avtalet lovar. Nu skrivs ingen rad alls.
+  //
+  // Anropas FORE varje insert mot agreement_acceptances. Returnerar true om
+  // anroparen ska avbryta.
+  function blockeraUtanKontrollsumma(hash, aterstall) {
+    if (!hashSaknas(hash)) return false;
+    toast("Godkännandet gick INTE igenom. Din webbläsare kunde inte beräkna den kontrollsumma som avtalet kräver, och vi registrerar hellre ingenting än ett godkännande som saknar den. Prova en annan webbläsare, eller hör av dig till OakStride så löser vi det åt dig.", true);
+    if (window.console && console.warn) console.warn("[oakstride] godkannande blockerat: kontrollsumman kunde inte beraknas");
+    if (typeof aterstall === "function") aterstall();
+    return true;
+  }
+  // ⚠️ BORTTAGET 2026-09-06: hashNotis/HASH_NOTIS lag har och gav kunden en
+  // NOTIS i kvittot nar kontrollsumman saknades. Efter Fredriks beslut skrivs ingen
+  // sadan rad langre - notisen ar alltsa dod kod, och tva mekanismer for samma sak
+  // ar precis det monster som fallde konfliktreceptet i agent#51: tva kallor till
+  // samma sanning, dar bara den ena styr utfallet. Historiken bevarar resonemanget.
+  //
+  // Det som star kvar av den gamla kommentaren, for att det galler an: en rad som
+  // REDAN ligger i drift med en attrapp far inget besked den har vagen. Matt
+  // 2026-09-06: noll sadana rader (0 av 1).
+  //
+  // (Gammal kommentar, bevarad for sammanhang:) `hashSaknas(hash)` ensam ar FEL
   // signal i kvittot: den laser klientens nyberaknade hash, och enda vagen som inte
   // returnerar tidigt ar 23505 - alltsa "raden fanns redan, INGENTING skrevs".
   // agreement_acceptances har unique (user_id, agreement_version), sa 23505 ar inte
@@ -244,11 +271,6 @@
   // koden fortfarande ratt, men da finns kunder vars godkannande saknar
   // kontrollsumma utan att portalen sager det - och det ar ett eget arende till
   // Fredrik, skilt fran k-20260906-01 som handlar om att blockera framat.
-  function hashNotis(res, hash) {
-    var skrevs = !(res && res.error);       // 23505 = fanns redan, inget skrevs
-    return (skrevs && hashSaknas(hash)) ? HASH_NOTIS : "";
-  }
-  var HASH_NOTIS = " OBS: kontrollsumman för avtalet kunde inte beräknas i din webbläsare, så godkännandet saknar den. Hör av dig till OakStride så noterar vi det.";
 
   // 5-stegsflödet. form: steg 1 klart via projektförfrågan. offer: steg 3 = godkänn
   // kravspec/offert + villkor + faktureringsuppgifter. site: steg 4 = godkänn sida & konfig.
@@ -812,6 +834,7 @@
   function acceptTerms(btn) {
     btn.disabled = true;
     sha256Hex(custAgreement.version + "\n" + custAgreement.html).then(function (hash) {
+      if (blockeraUtanKontrollsumma(hash, function () { btn.disabled = false; })) return;
       sb.from("agreement_acceptances").insert({
         user_id: cuid(),
         agreement_version: custAgreement.version,
@@ -824,7 +847,7 @@
           if (n) { n.hidden = false; n.className = "status-note error"; n.textContent = "Kunde inte spara: " + res.error.message; }
           btn.disabled = false; return;
         }
-        toast("Tack! Villkoren är godkända." + hashNotis(res, hash), !!hashNotis(res, hash));
+        toast("Tack! Villkoren är godkända.");
         loadOnboarding();
       });
     });
@@ -1898,6 +1921,13 @@
     if (!spec) return;
     var summary = orderSummaryText(spec.data, ordered);
     sha256Hex(custAgreement.version + "\n" + custAgreement.html).then(function (hash) {
+      // Den har vagen fyras av en KRYSSRUTA, inte en knapp. Aterstallningen maste
+      // darfor kryssa ur den - annars star rutan ikryssad efter ett blockerat
+      // godkannande, vilket ser ut som att det gick igenom.
+      if (blockeraUtanKontrollsumma(hash, function () {
+            var ruta = document.querySelector("[data-approve-offer4]");
+            if (ruta) ruta.checked = false;
+          })) return;
       sb.from("agreement_acceptances").insert({
         user_id: cuid(), agreement_version: custAgreement.version, document_title: custAgreement.title,
         document_hash: hash, user_agent: navigator.userAgent, order_summary: summary
@@ -1921,8 +1951,7 @@
             if (window.console && console.warn) console.warn("[oakstride] extra_work_approvals:", r3.error);
             return;
           }
-          toast("Tack! Den uppdaterade offerten är godkänd — en ny orderbekräftelse skickas." +
-                hashNotis(r2, hash), !!hashNotis(r2, hash));
+          toast("Tack! Den uppdaterade offerten är godkänd — en ny orderbekräftelse skickas.");
           loadOnboarding();
         });
       });
@@ -1941,6 +1970,10 @@
       if (r1.error) { toast("Kunde inte spara faktureringsuppgifter: " + r1.error.message, true); btn.disabled = false; return; }
       var summary = orderSummaryText(spec.data, ordered);
       sha256Hex(custAgreement.version + "\n" + custAgreement.html).then(function (hash) {
+        // 🔴 Faktureringsuppgifterna ar redan sparade har (upserten ovan).
+        // Det ar med flit: de ar kundens egna uppgifter och ska inte kastas bort for
+        // att kontrollsumman felade. Det som INTE skrivs ar godkannandet.
+        if (blockeraUtanKontrollsumma(hash, function () { btn.disabled = false; })) return;
         sb.from("agreement_acceptances").insert({
           user_id: cuid(), agreement_version: custAgreement.version, document_title: custAgreement.title,
           document_hash: hash, user_agent: navigator.userAgent, order_summary: summary
@@ -1956,8 +1989,7 @@
               btn.disabled = false;
               return;
             }
-            toast("Tack! Offert och villkor godkända — en orderbekräftelse skickas till din e-post." +
-                  hashNotis(r2, hash), !!hashNotis(r2, hash));
+            toast("Tack! Offert och villkor godkända — en orderbekräftelse skickas till din e-post.");
             loadOnboarding();
           });
         });
