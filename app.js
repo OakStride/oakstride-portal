@@ -1973,22 +1973,34 @@
 
   // Steg 4: godkänn den uppdaterade kravspecen/offerten (faktureringsuppgifter finns redan).
   function approveUpdatedOffer(spec, ordered) {
-    if (previewBlocked()) return;
-    if (!spec) return;
+    // Aven de tva tidiga utgangarna kryssar ur: i forhandslage toastar
+    // previewBlocked() att inget gar att andra, och da ska rutan inte sta kvar
+    // ikryssad bredvid det beskedet. `kryssaUr` ar en funktionsdeklaration langre
+    // ned i samma slutning och ar alltsa hoistad hit.
+    if (previewBlocked()) { kryssaUr(); return; }
+    if (!spec) { kryssaUr(); return; }
     var summary = orderSummaryText(spec.data, ordered);
+    // Den har vagen fyras av en KRYSSRUTA, inte en knapp. Varje utgang som INTE
+    // lyckas maste darfor kryssa ur den - annars star rutan kvar ikryssad, alltsa
+    // ser godkand ut, samtidigt som notisen bredvid sager att det inte gick. Och ett
+    // nytt forsok kraver da TVA klick, for change-hanteraren fyrar bara pa
+    // `offer4.checked`: kunden maste forst kryssa ur och sedan i igen.
+    //
+    // 🔴 RATTAT efter granskningens runda 3. Uncheckningen fanns bara pa
+    // VAKTENS vag - de tva databasfelgrenarna nedan lamnade rutan ikryssad. Jag skrev
+    // sjalv skalet till uncheckningen nar jag la den pa vakten, och da galler det
+    // lika mycket dar. Ett stalle kryssar ur; tre vagar anvander det.
+    function kryssaUr() {
+      var ruta = document.querySelector("[data-approve-offer4]");
+      if (ruta) ruta.checked = false;
+    }
     sha256Hex(custAgreement.version + "\n" + custAgreement.html).then(function (hash) {
-      // Den har vagen fyras av en KRYSSRUTA, inte en knapp. Aterstallningen maste
-      // darfor kryssa ur den - annars star rutan ikryssad efter ett blockerat
-      // godkannande, vilket ser ut som att det gick igenom.
-      if (blockeraUtanKontrollsumma(hash, function () {
-            var ruta = document.querySelector("[data-approve-offer4]");
-            if (ruta) ruta.checked = false;
-          }, "hash-status-uppdaterad")) return;
+      if (blockeraUtanKontrollsumma(hash, kryssaUr, "hash-status-uppdaterad")) return;
       sb.from("agreement_acceptances").insert({
         user_id: cuid(), agreement_version: custAgreement.version, document_title: custAgreement.title,
         document_hash: hash, user_agent: navigator.userAgent, order_summary: summary
       }).then(function (r2) {
-        if (r2.error && r2.error.code !== "23505") { visaFel("hash-status-uppdaterad", "Kunde inte spara: " + r2.error.message); return; }
+        if (r2.error && r2.error.code !== "23505") { visaFel("hash-status-uppdaterad", "Kunde inte spara: " + r2.error.message); kryssaUr(); return; }
         // 🔴 TILLAGT efter tystnadsgranskning (blockerande fynd 1). Callbacken
         // tog INGET argument - `res.error` lastes aldrig. Tabellen har primarnyckel
         // (user_id, spec_version), sa ett dubbelklick ger en realistisk 23505; men
@@ -2005,6 +2017,7 @@
             visaFel("hash-status-uppdaterad", "Godkännandet kunde inte registreras: " +
                     (r3.error.message || "okänt fel") + ". Försök igen, eller hör av dig till OakStride.");
             if (window.console && console.warn) console.warn("[oakstride] extra_work_approvals:", r3.error);
+            kryssaUr();
             return;
           }
           toast("Tack! Den uppdaterade offerten är godkänd — en ny orderbekräftelse skickas.");
