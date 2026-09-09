@@ -1,17 +1,28 @@
 -- Migration 35: agreement_acceptances.order_summary skrivs ned i repot
 --
--- Version 4. Underkänd tre gånger: **v1 på fyra punkter** (två blockerande — det osanna
--- no-op-påståendet och radnummer mätta på en omergad gren; två bör-fixas — vakten mätte
--- eftertillståndet, och den enda nåbara kontrollen felade mjukt), **v2 på en** (temptabellen
--- åberopade migration 29:s mönster men tappade dess härdning), **v3 på en** (beviset som
--- ersatte det tillbakadragna `count(*)`-beviset angav en omfattning och ett tal som inte
--- reproducerade). 🔴 v2:s huvud sa "tre punkter" och bar fyra rättelsemarkörer — den
--- räkningen är hela poängen med att skriva ned dem, så den är rättad här. Samtliga står som
--- "RÄTTAT" nedan med mätningen som avgjorde saken.
+-- Version 5. Underkänd fyra gånger, **åtta fynd**:
+--   v1 på FYRA — det osanna no-op-påståendet · radnummer mätta på en omergad gren ·
+--                vakten mätte eftertillståndet · den enda nåbara kontrollen felade mjukt
+--   v2 på TVÅ  — temptabellen åberopade migration 29:s mönster men tappade dess härdning ·
+--                huvudet sa "tre punkter" och bar fyra rättelsemarkörer
+--   v3 på ETT  — beviset som ersatte det tillbakadragna `count(*)`-beviset angav en
+--                omfattning och ett tal som inte reproducerade
+--   v4 på ETT  — den här sammanfattningen var falsk (se nedan)
 --
--- **Sex av sex fynd satt i FILHUVUDET, inte i koden.** Ingen granskningsrunda har haft en
--- invändning mot SQL:en. För en migration vars enda produkt är dokumentation är huvudet
--- leveransen — läs rättelserna innan du ändrar något här.
+-- 🔴 **RÄTTAT (v5), och det här är den fjärde versionen i rad där räkningen var fel.** v4
+-- skrev *"sex av sex fynd satt i FILHUVUDET, inte i koden. Ingen granskningsrunda har haft en
+-- invändning mot SQL:en."* Båda halvorna var osanna, och den andra halvan var skadlig: den
+-- gav en läsare skäl att hoppa över just de rader som verkställer något. **Tre av de åtta
+-- fynden ändrade körbar kod**, uppmätt med `git show <commit>:… | grep -vE '^\s*--'`:
+--   v1→v2  `raise warning` → `raise exception … , v_typ`         (typkontrollens kanal)
+--   v1→v2  mätpunkten flyttad före ALTER, temptabellen tillkom   (vakten)
+--   v2→v3  `if not exists` + `delete from` + `insert into`       (härdningen)
+-- Kommentaren vid typkontrollen var dessutom korrekt medan koden inte var det — så
+-- "huvudet är leveransen" får inte läsas som "koden är genomläst". **Granska varje version
+-- för sig**, samma slutsats som `migration-29-repot-beskriver-databasen.sql:4-7` drar av att
+-- ett av dess fynd var en regression införd när v1 lagades.
+--
+-- Samtliga åtta står som "RÄTTAT" nedan med mätningen som avgjorde saken.
 --
 -- Dokumentation, inte en beteendeändring i drift. Samma sort som 29, 32 och 33: kolumnen
 -- FINNS i produktion, den saknas bara i repot.
@@ -117,15 +128,23 @@
 -- omfattningen ger 32 träffar. **Rätt omfattning är portal-repot.** Uppmätt 2026-09-09, i
 -- repots rot, med den här filen undantagen:
 --
---   grep -rn order_summary . --exclude-dir=.git --exclude=migration-35-order-summary.sql
+--   git grep -n order_summary -- ':!supabase/migration-35-order-summary.sql'
 --     app.js:1725                                     — skriver
 --     app.js:1750                                     — skriver
 --     supabase/migration-23-notify-published-email.sql:83  — läser
 --     supabase/migration-23-notify-published-email.sql:90  — läser
 --
--- Fyra träffar i två filer. Noll av dem innehåller `create` eller `add column` (samma grep
--- med `-icE "create|add column"` ger 0). Kolumnen kom alltså in som en lös sats för hand.
--- Den här filen är det som gör kedjan hel igen.
+-- Fyra träffar i två filer, båda ANVÄNDNINGAR. ⚠️ Använd `git grep`, inte `grep -rn`: repot
+-- saknar `.gitignore`, och `portal/.claude/` är varken spårad eller ignorerad. Ett `grep -rn`
+-- i ett arbetsträd som har den mappen ger FEM träffar — den femte är en agentanteckning som
+-- citerar den här filen. En färsk klon ger fyra. Det är samma reproduktionsdefekt som fällde
+-- v3, en gång till, och den här raden finns för att den inte ska uppstå en tredje gång.
+--
+-- **Det bärande beviset är inte träffräkningen utan frånvaron av en definition:**
+--   git grep -in "order_summary" -- ':!supabase/migration-35-order-summary.sql' \
+--     | grep -icE "create|add column"      ->  0
+-- Noll definitioner, oavsett hur många omnämnanden man råkar räkna. Kolumnen kom alltså in
+-- som en lös sats för hand. Den här filen är det som gör kedjan hel igen.
 --
 -- 📏 Och grenen den finns för används: `select count(*), count(order_summary) from
 -- public.agreement_acceptances` gav **1 av 1** — raden har ett order_summary, så
