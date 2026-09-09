@@ -1,14 +1,17 @@
 -- Migration 35: agreement_acceptances.order_summary skrivs ned i repot
 --
--- Version 3. Underkänd två gånger: **v1 på fyra punkter** (två blockerande — det osanna
+-- Version 4. Underkänd tre gånger: **v1 på fyra punkter** (två blockerande — det osanna
 -- no-op-påståendet och radnummer mätta på en omergad gren; två bör-fixas — vakten mätte
 -- eftertillståndet, och den enda nåbara kontrollen felade mjukt), **v2 på en** (temptabellen
--- åberopade migration 29:s mönster men tappade dess härdning). 🔴 v2:s huvud sa "tre punkter"
--- och bar fyra rättelsemarkörer — den räkningen är hela poängen med att skriva ned dem, så
--- den är rättad här. Samtliga står som "RÄTTAT" nedan med mätningen som avgjorde saken.
+-- åberopade migration 29:s mönster men tappade dess härdning), **v3 på en** (beviset som
+-- ersatte det tillbakadragna `count(*)`-beviset angav en omfattning och ett tal som inte
+-- reproducerade). 🔴 v2:s huvud sa "tre punkter" och bar fyra rättelsemarkörer — den
+-- räkningen är hela poängen med att skriva ned dem, så den är rättad här. Samtliga står som
+-- "RÄTTAT" nedan med mätningen som avgjorde saken.
 --
--- Fem av fem fynd satt i FILHUVUDET, inte i koden. För en migration vars enda produkt är
--- dokumentation är huvudet leveransen — läs dem innan du ändrar något här.
+-- **Sex av sex fynd satt i FILHUVUDET, inte i koden.** Ingen granskningsrunda har haft en
+-- invändning mot SQL:en. För en migration vars enda produkt är dokumentation är huvudet
+-- leveransen — läs rättelserna innan du ändrar något här.
 --
 -- Dokumentation, inte en beteendeändring i drift. Samma sort som 29, 32 och 33: kolumnen
 -- FINNS i produktion, den saknas bara i repot.
@@ -105,10 +108,24 @@
 -- bevisar bara att inget EXTRA har körts — inte att de 28 kördes.
 --
 -- Det som faktiskt bär slutsatsen är enklare och oberoende av liggaren: **ingen fil i repot
--- skapar kolumnen**, varken bland de baseline-bokförda eller de körda. `grep -rn order_summary`
--- över hela `studio/` ger tre träffar, och alla tre ANVÄNDER den — app.js två gånger och
--- migration 23 en gång. Kolumnen kom alltså in som en lös sats för hand. Den här filen är det
--- som gör kedjan hel igen.
+-- skapar kolumnen**, varken bland de baseline-bokförda eller de körda.
+--
+-- 🔴 RÄTTAT (v4): version 3 skrev här *"`grep -rn order_summary` över hela `studio/` ger tre
+-- träffar … migration 23 en gång"*. Båda talen var fel, och meningen är just den som ERSATTE
+-- det tillbakadragna `count(*)`-beviset — ett bevis som inte reproducerar är inte bättre än
+-- det man tog bort. `studio/` innehåller minnesfiler som numera skriver om saken, så den
+-- omfattningen ger 32 träffar. **Rätt omfattning är portal-repot.** Uppmätt 2026-09-09, i
+-- repots rot, med den här filen undantagen:
+--
+--   grep -rn order_summary . --exclude-dir=.git --exclude=migration-35-order-summary.sql
+--     app.js:1725                                     — skriver
+--     app.js:1750                                     — skriver
+--     supabase/migration-23-notify-published-email.sql:83  — läser
+--     supabase/migration-23-notify-published-email.sql:90  — läser
+--
+-- Fyra träffar i två filer. Noll av dem innehåller `create` eller `add column` (samma grep
+-- med `-icE "create|add column"` ger 0). Kolumnen kom alltså in som en lös sats för hand.
+-- Den här filen är det som gör kedjan hel igen.
 --
 -- 📏 Och grenen den finns för används: `select count(*), count(order_summary) from
 -- public.agreement_acceptances` gav **1 av 1** — raden har ett order_summary, så
@@ -133,10 +150,13 @@ set client_encoding to 'UTF8';
 -- saker, båda med skäl:
 --   * `if not exists` + `delete from` i stället för ett naket `create` — annars dör filen på
 --     `relation "_m35_fore" already exists` vid en OMKÖRNING FÖR HAND, alltså i Supabases
---     SQL-editor. Det är inte ett hypotetiskt läge: det är så 24 av repots migrationer
---     historiskt hamnade i drift, och det är den troliga vägen i en återuppbyggnad — som är
---     hela skälet till att den här filen finns. Felmeddelandet hade dessutom handlat om en
---     temptabell i stället för om det som faktiskt gick fel.
+--     SQL-editor. Det är inte ett hypotetiskt läge: handkörning är den historiska vägen in i
+--     den här databasen, och den troliga vägen i en återuppbyggnad — som är hela skälet till
+--     att den här filen finns. Felmeddelandet hade dessutom handlat om en temptabell i
+--     stället för om det som faktiskt gick fel.
+--     ⚠️ Här stod först "24 av repots migrationer" — den siffran är hämtad ur liggarens
+--     `baseline`-rader, alltså ur samma bokföring som filen fyrtio rader ned förklarar att
+--     man inte ska lita på. Argumentet står utan siffran, så siffran är borta.
 --   * INTE `on commit drop` — körs filen sats för sig commitas `create temp table` för sig,
 --     tabellen släpps omedelbart, och DO-blocket dör på "does not exist".
 -- Under `kor-migrationer.yml` (`psql -1`) kan inget av detta fyra, eftersom ett fel rullar
