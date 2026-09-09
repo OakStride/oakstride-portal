@@ -1,89 +1,142 @@
 -- Migration 35: agreement_acceptances.order_summary skrivs ned i repot
 --
--- Dokumentation, inte en beteendeandring i drift. Samma sort som 29, 32 och 33:
--- kolumnen FINNS i produktion, den saknas bara i repot.
+-- Version 2. Underkänd en gång, på tre punkter — alla tre stod i filhuvudet, inte i koden,
+-- och för en migration vars enda produkt är dokumentation ÄR huvudet leveransen. De står
+-- som "RÄTTAT" nedan med mätningen som avgjorde saken. Läs dem innan du ändrar något här.
 --
--- ⚠️ FILEN SKA VARA EN NO-OP MOT PRODUKTION. Den enda villkorslosa satsen ar
--- `set client_encoding`. Sjalva tillagget ar `add column if not exists`, och en vakt
--- efterat sager till om den faktiskt gjorde nagot.
+-- Dokumentation, inte en beteendeändring i drift. Samma sort som 29, 32 och 33: kolumnen
+-- FINNS i produktion, den saknas bara i repot.
+--
+-- ⚠️ FILEN ÄR EN NO-OP I INNEHÅLL MOT PRODUKTION — men inte genom att varje sats är
+-- villkorad. 🔴 RÄTTAT: version 1 påstod att `set client_encoding` var den enda villkorslösa
+-- satsen. Det var osant, och det är exakt det påstående migration 29 underkändes för i sin
+-- egen version 1 (se `migration-29-repot-beskriver-databasen.sql:9-13`). Följande körs
+-- VILLKORSLÖST:
+--   * `set client_encoding`                       — ofarlig, men körs alltid
+--   * `create temp table` + `drop table`          — bara i sessionen, men körs alltid
+--   * `alter table ... add column if not exists`  — no-op i INNEHÅLL, men Postgres väljer
+--     låsnivå ur underkommandot och tar **ACCESS EXCLUSIVE** på `agreement_acceptances`
+--     INNAN `if not exists` prövas. Låset hålls till commit, alltså genom hela DO-blocket,
+--     eftersom `kor-migrationer.yml` kör filen med `psql -1`.
+--
+-- Vad det betyder i praktiken: väntar ALTER-satsen på en öppen transaktion mot tabellen
+-- ställer sig varje nytt avtalsgodkännande i kö bakom den. Tabellen är liten (migration 34
+-- mätte 1 rad 2026-09-06), så fönstret är kort — men det är inte noll, och det ska stå här
+-- i stället för att låta någon läsa "no-op" som "rör ingenting".
+--
+-- ⚠️ Inget `lock_timeout` sätts. Det gör ingen annan fil i `supabase/` heller (grep: noll
+-- träffar), och jag inför inte ett nytt mönster ensidigt i en dokumentationsmigration.
+-- Ska det finnas hör det hemma i `kor-migrationer.yml`, för alla filer, inte i den här.
 --
 -- ============================ HUR GLAPPET HITTADES ============================
--- Provet 2026-09-09 (Fredriks kort k-20260906-05, "kor provet lokalt"): hela repot
--- byggdes till en databas i PGlite och jamfordes mot drift. Funktioner, policies och
--- triggers var IDENTISKA - 114 objekt, samma md5. Kolumnerna var det inte:
+-- Provet 2026-09-09 (Fredriks kort k-20260906-05, "kör provet lokalt"): hela repot byggdes
+-- till en databas i PGlite, sats för sats, och jämfördes mot drift. Funktioner, policies och
+-- triggers var IDENTISKA — 114 objekt, samma md5. Kolumnerna var det inte:
 --
 --   drift  151 kolumner i public (utan applied_migrations)
 --   repot  150
 --   skillnaden: agreement_acceptances.order_summary
 --
--- Tidigare kartlaggningar missade den for att de jamforde OBJEKT, aldrig kolumner.
--- Ratt kontroll fanns, men inte pa den niva dar felet satt.
+-- Tidigare kartläggningar missade den för att de jämförde OBJEKT. En kolumn-för-kolumn-diff
+-- var uttryckligen inte gjord — det står i `studio/minne/kunskap-db-mot-repo.md`.
 --
--- ============================ VARFOR DET SPELAR ROLL ============================
--- Kolumnen ar inte oanvand. Tva stallen rakar ut for den:
+-- ============================ VARFÖR DET SPELAR ROLL ============================
+-- Kolumnen är inte oanvänd. Två ställen råkar ut för den:
 --
---   portal/app.js:2001 och :2048
---     skriver order_summary vid VARJE avtalsgodkannande.
+--   app.js:1725 och :1750   (radnummer på origin/main, kontrollerade där)
+--     skriver order_summary vid båda avtalsvägarna — `approveOffer` och `approveUpdatedOffer`.
 --   supabase/migration-23-notify-published-email.sql:83 och :90
---     laser new.order_summary i aviseringstriggern.
+--     läser new.order_summary i aviseringstriggern.
 --
--- I en ateruppbyggnad ur repot hade alltsa avtalsgodkannandet fallit pa en okand
--- kolumn, och aviseringen med den. Det ar agreement_acceptances - tabellen som bar
--- beviset for att kunden godkant avtalet. Se studio/minne/kunskap-avtal-villkor.md.
+-- 🔴 RÄTTAT: version 1 angav app.js-raderna som 2001 och 2048. De siffrorna är mätta i ett
+-- arbetsträd som stod på den OMERGADE grenen `fix/blockera-utan-kontrollsumma` (PR #69), där
+-- de stämmer. På main är det 1725 och 1750. Sakpåståendet höll, koordinaterna gjorde det inte.
+-- ✅ Kontrollerat efteråt att provet ändå mätte rätt filuppsättning: `git diff origin/main
+-- origin/fix/blockera-utan-kontrollsumma -- supabase/` är TOM, så migrationsfilerna som
+-- byggdes var main:s. Det är den kontrollen som gör siffrorna nedan giltiga — inte att jag
+-- tror det.
 --
--- ============================ KVITTO PA MATNINGEN ============================
--- Mot drift (wtekqlkkcomtgizjtqeo) 2026-09-09. Kor om och jamfor:
+-- I en återuppbyggnad ur repot hade alltså avtalsgodkännandet fallit på en okänd kolumn, och
+-- aviseringen med den. Det är `agreement_acceptances` — tabellen som bär beviset för att
+-- kunden godkänt avtalet. Se `studio/minne/kunskap-avtal-villkor.md`.
+--
+-- ============================ KVITTO PÅ MÄTNINGEN ============================
+-- Mot drift (wtekqlkkcomtgizjtqeo) 2026-09-09. Kör om och jämför — påstå ingenting härifrån
+-- utan att ha gjort det:
 --
 --   select column_name, data_type, is_nullable, column_default
 --     from information_schema.columns
 --    where table_schema='public' and table_name='agreement_acceptances'
 --    order by ordinal_position;
 --
--- Gav nio rader, den nionde:
---   order_summary | text | YES | (inget default)
+-- Gav nio rader, den nionde:  order_summary | text | YES | (inget default)
 --
--- Och:
 --   select count(*) from applied_migrations;   -> 28
--- alltsa exakt de 28 filer som ligger i repot. Kolumnen kom in FOR HAND, utanfor
--- migrationskedjan. Den har filen ar det som gor kedjan hel igen.
 --
--- ⚠️ Ingen `not null`, inget default - med flit. Sa ser den ut i drift, och en
--- `not null` hade dessutom fallit pa befintliga rader. Skriv inte om den till nagot
--- "snyggare" an det som faktiskt korr.
+-- alltså exakt de 28 filer som ligger i repot. Kolumnen kom in FÖR HAND, utanför
+-- migrationskedjan. Den här filen är det som gör kedjan hel igen.
+--
+-- ⚠️ Ingen `not null`, inget default — med flit. Så ser den ut i drift, och en `not null`
+-- hade dessutom fallit på befintliga rader. Skriv inte om den till något "snyggare" än det
+-- som faktiskt kör.
 
 set client_encoding to 'UTF8';
 
-alter table public.agreement_acceptances
-  add column if not exists order_summary text;
-
--- Vakt. I drift ska den ha funnits innan; i en ateruppbyggnad ar det vantat att den
--- skapades nu. Bada lagen ar giltiga - det ar DARFOR den sager vilket det var, i
--- stallet for att tiga. kor-migrationer.yml lyfter warning till en annotering.
-do $$
-declare
-  v_finns boolean;
-begin
+-- 🔴 RÄTTAT: version 1 mätte kolumnens existens EFTER `add column` och kunde därför aldrig
+-- skilja "fanns redan i drift" från "skapades nu i en återuppbyggnad" — de två lägen huvudet
+-- lovade att den skulle skilja. Katalogen ser likadan ut i båda fallen. Både granskaren och
+-- tystnadsgranskaren fann samma sak, oberoende av varandra.
+-- Mätningen måste alltså ske FÖRE. Temptabell, samma mönster som `_f29_fore` i migration 29.
+create temp table _m35_fore as
   select exists (
     select 1 from information_schema.columns
      where table_schema = 'public'
        and table_name   = 'agreement_acceptances'
        and column_name  = 'order_summary'
-  ) into v_finns;
+  ) as fanns;
 
-  if not v_finns then
-    -- Kan bara intraffa om `add column` ovan tystnade, vilket den inte kan. Star har
-    -- anda: en vakt som bara kontrollerar det forvantade larmar aldrig om det ovantade.
-    raise exception 'migration 35: order_summary saknas EFTER add column. Nagot har stoppat satsen.';
+alter table public.agreement_acceptances
+  add column if not exists order_summary text;
+
+do $$
+declare
+  v_fanns_innan boolean;
+  v_typ         text;
+begin
+  select fanns into v_fanns_innan from _m35_fore;
+
+  select data_type into v_typ
+    from information_schema.columns
+   where table_schema = 'public'
+     and table_name   = 'agreement_acceptances'
+     and column_name  = 'order_summary';
+
+  if v_typ is null then
+    -- Kan bara inträffa om ALTER-satsen ovan tystnade, vilket den inte kan i samma
+    -- transaktion. Står här ändå: en vakt som bara kontrollerar det förväntade larmar
+    -- aldrig om det oväntade.
+    raise exception 'migration 35: order_summary saknas EFTER add column. Något har stoppat satsen.';
   end if;
 
-  -- Sag ocksa nagot om typen. En kolumn som finns men ar t.ex. jsonb ar inte samma
-  -- kolumn, och `add column if not exists` hade da tigit och latit den vara.
-  perform 1 from information_schema.columns
-   where table_schema='public' and table_name='agreement_acceptances'
-     and column_name='order_summary' and data_type='text';
-  if not found then
-    raise warning 'migration 35: order_summary finns men ar INTE text. Repot och drift beskriver da olika kolumner.';
+  if v_typ <> 'text' then
+    -- 🔴 RÄTTAT: version 1 hade `raise warning` här. Det var fel kanal för ett fel som inte
+    -- går att komma tillbaka till: `add column if not exists` tiger om kolumnen finns med FEL
+    -- typ, en varning låter psql avsluta med 0, och då bokförs filen och SHA-låses. Den kan
+    -- aldrig köras om automatiskt (`kor-migrationer.yml`), och liggaren skulle påstå att
+    -- glappet är stängt medan repot och drift beskriver olika kolumner — permanent. Samma
+    -- val som `migration-34-kontrollsumma-check.sql` gör för sin efterkontroll.
+    raise exception 'migration 35: order_summary är "%", inte text. Repot och drift beskriver då olika kolumner, och en varning här hade bokfört filen som klar.', v_typ;
+  end if;
+
+  -- Två giltiga lägen, och NU går de att skilja åt. Warning i återuppbyggnadsfallet, för att
+  -- `kor-migrationer.yml` lyfter WARNING till en annotering men låter NOTICE stanna i loggen
+  -- — och "filen gjorde något mot en databas som skulle ha haft kolumnen" är det läge som
+  -- förtjänar att synas.
+  if v_fanns_innan then
+    raise notice 'migration 35: order_summary fanns redan (typ text). No-op, som väntat mot produktion.';
   else
-    raise notice 'migration 35: order_summary finns och ar text.';
+    raise warning 'migration 35: order_summary SAKNADES och skapades nu. Väntat i en återuppbyggnad ur repot — ALARMERANDE mot produktion, där den var uppmätt som befintlig 2026-09-09.';
   end if;
 end $$;
+
+drop table _m35_fore;
