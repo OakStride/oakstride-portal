@@ -1,13 +1,14 @@
 -- Migration 35: agreement_acceptances.order_summary skrivs ned i repot
 --
--- Version 5. Underkänd fyra gånger, **åtta fynd**:
+-- Version 6. Underkänd fyra gånger, GODKÄND i femte rundan. **Nio fynd**:
 --   v1 på FYRA — det osanna no-op-påståendet · radnummer mätta på en omergad gren ·
 --                vakten mätte eftertillståndet · den enda nåbara kontrollen felade mjukt
 --   v2 på TVÅ  — temptabellen åberopade migration 29:s mönster men tappade dess härdning ·
 --                huvudet sa "tre punkter" och bar fyra rättelsemarkörer
 --   v3 på ETT  — beviset som ersatte det tillbakadragna `count(*)`-beviset angav en
 --                omfattning och ett tal som inte reproducerade
---   v4 på ETT  — den här sammanfattningen var falsk (se nedan)
+--   v4 på ETT  — sammanfattningen av granskningen var falsk (se nedan)
+--   v5 på ETT  — en hjälpkontroll beskrevs som "det bärande beviset"; godkänd ändå
 --
 -- 🔴 **RÄTTAT (v5), och det här är den fjärde versionen i rad där räkningen var fel.** v4
 -- skrev *"sex av sex fynd satt i FILHUVUDET, inte i koden. Ingen granskningsrunda har haft en
@@ -22,7 +23,8 @@
 -- för sig**, samma slutsats som `migration-29-repot-beskriver-databasen.sql:4-7` drar av att
 -- ett av dess fynd var en regression införd när v1 lagades.
 --
--- Samtliga åtta står som "RÄTTAT" nedan med mätningen som avgjorde saken.
+-- Samtliga nio står som "RÄTTAT" nedan med mätningen som avgjorde saken. ⚠️ Räkna om om du
+-- lägger till ett — den här raden har varit fel fyra versioner i rad.
 --
 -- Dokumentation, inte en beteendeändring i drift. Samma sort som 29, 32 och 33: kolumnen
 -- FINNS i produktion, den saknas bara i repot.
@@ -140,11 +142,23 @@
 -- citerar den här filen. En färsk klon ger fyra. Det är samma reproduktionsdefekt som fällde
 -- v3, en gång till, och den här raden finns för att den inte ska uppstå en tredje gång.
 --
--- **Det bärande beviset är inte träffräkningen utan frånvaron av en definition:**
---   git grep -in "order_summary" -- ':!supabase/migration-35-order-summary.sql' \
---     | grep -icE "create|add column"      ->  0
--- Noll definitioner, oavsett hur många omnämnanden man råkar räkna. Kolumnen kom alltså in
--- som en lös sats för hand. Den här filen är det som gör kedjan hel igen.
+-- 🔑 **Beviset är LISTAN ovan, inte ett tal.** Fyra träffar, var och en utskriven med
+-- `skriver`/`läser`. Dyker en femte upp syns den i listan och går att läsa. Det är den formen
+-- som bär — inte en räkning, hur robust den än låter.
+--
+-- 🔴 RÄTTAT (v6): version 5 kallade räkningen nedan *"det bärande beviset"* och sa att den
+-- gällde *"oavsett hur många omnämnanden man råkar räkna"*. Den lovar mer än den klarar:
+--   git grep -in "order_summary" -- ':!…' | grep -icE "create|add column"   ->  0
+-- Kontrollen letar `create` eller `add column` **på samma rad som kolumnnamnet**, och en
+-- kolumn som definieras inuti ett `create table (…)`-block står ensam på sin rad utan något
+-- av orden. Den formen är inte hypotetisk: `migration-5-agreements.sql:8-18` definierar just
+-- den här tabellen precis så, en kolumn per rad. Hade `order_summary` legat i det blocket
+-- hade räkningen sagt noll ändå. **Den är alltså ett komplement, inte ett bevis** — den
+-- utesluter en `alter table … add column` någon annanstans, och det är allt.
+--
+-- Konklusionen står: läst för hand är `migration-5:8-18` åtta kolumner utan `order_summary`,
+-- och `schema.sql` innehåller inte tabellen alls. Kolumnen kom in som en lös sats för hand.
+-- Den här filen är det som gör kedjan hel igen.
 --
 -- 📏 Och grenen den finns för används: `select count(*), count(order_summary) from
 -- public.agreement_acceptances` gav **1 av 1** — raden har ett order_summary, så
