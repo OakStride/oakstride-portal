@@ -1,0 +1,251 @@
+-- Migration 35: agreement_acceptances.order_summary skrivs ned i repot
+--
+-- Version 6. Underkänd fyra gånger, GODKÄND i femte rundan. **Nio fynd**:
+--   v1 på FYRA — det osanna no-op-påståendet · radnummer mätta på en omergad gren ·
+--                vakten mätte eftertillståndet · den enda nåbara kontrollen felade mjukt
+--   v2 på TVÅ  — temptabellen åberopade migration 29:s mönster men tappade dess härdning ·
+--                huvudet sa "tre punkter" och bar fyra rättelsemarkörer
+--   v3 på ETT  — beviset som ersatte det tillbakadragna `count(*)`-beviset angav en
+--                omfattning och ett tal som inte reproducerade
+--   v4 på ETT  — sammanfattningen av granskningen var falsk (se nedan)
+--   v5 på ETT  — en hjälpkontroll beskrevs som "det bärande beviset"; godkänd ändå
+--
+-- 🔴 **RÄTTAT (v5), och det här är den fjärde versionen i rad där räkningen var fel.** v4
+-- skrev *"sex av sex fynd satt i FILHUVUDET, inte i koden. Ingen granskningsrunda har haft en
+-- invändning mot SQL:en."* Båda halvorna var osanna, och den andra halvan var skadlig: den
+-- gav en läsare skäl att hoppa över just de rader som verkställer något. **Tre av de åtta
+-- fynden ändrade körbar kod**, uppmätt med `git show <commit>:… | grep -vE '^\s*--'`:
+--   v1→v2  `raise warning` → `raise exception … , v_typ`         (typkontrollens kanal)
+--   v1→v2  mätpunkten flyttad före ALTER, temptabellen tillkom   (vakten)
+--   v2→v3  `if not exists` + `delete from` + `insert into`       (härdningen)
+-- Kommentaren vid typkontrollen var dessutom korrekt medan koden inte var det — så
+-- "huvudet är leveransen" får inte läsas som "koden är genomläst". **Granska varje version
+-- för sig**, samma slutsats som `migration-29-repot-beskriver-databasen.sql:4-7` drar av att
+-- ett av dess fynd var en regression införd när v1 lagades.
+--
+-- Samtliga nio står som "RÄTTAT" nedan med mätningen som avgjorde saken. ⚠️ Räkna om om du
+-- lägger till ett — den här raden har varit fel fyra versioner i rad.
+--
+-- Dokumentation, inte en beteendeändring i drift. Samma sort som 29, 32 och 33: kolumnen
+-- FINNS i produktion, den saknas bara i repot.
+--
+-- ⚠️ FILEN ÄR EN NO-OP I INNEHÅLL MOT PRODUKTION — men inte genom att varje sats är
+-- villkorad. 🔴 RÄTTAT: version 1 påstod att `set client_encoding` var den enda villkorslösa
+-- satsen. Det var osant, och det är exakt det påstående migration 29 underkändes för i sin
+-- egen version 1 (se `migration-29-repot-beskriver-databasen.sql:9-13`). Följande körs
+-- VILLKORSLÖST:
+--   * `set client_encoding`                       — ofarlig, men körs alltid
+--   * `create temp table` + `drop table`          — bara i sessionen, men körs alltid
+--   * `alter table ... add column if not exists`  — no-op i INNEHÅLL, men Postgres väljer
+--     låsnivå ur underkommandot och tar **ACCESS EXCLUSIVE** på `agreement_acceptances`
+--     INNAN `if not exists` prövas. Låset hålls till commit, alltså genom hela DO-blocket,
+--     eftersom `kor-migrationer.yml` kör filen med `psql -1`.
+--
+-- Vad det betyder i praktiken: väntar ALTER-satsen på en öppen transaktion mot tabellen
+-- ställer sig varje nytt avtalsgodkännande i kö bakom den. Tabellen är liten (1 rad, mätt
+-- 2026-09-09), så fönstret är kort — men det är inte noll, och det ska stå här i stället för
+-- att låta någon läsa "no-op" som "rör ingenting".
+--
+-- 📏 UPPMÄTT 2026-09-09, så att det blir en siffra och inte en åsikt
+-- (`select setconfig from pg_db_role_setting`):
+--   authenticator  statement_timeout=8s, **lock_timeout=8s**   ← PostgREST ansluter som denna
+--   authenticated  statement_timeout=8s
+--   anon           statement_timeout=3s
+--   postgres       inget lock_timeout; statement_timeout = klustrets 2min
+-- Kundens avtalsgodkännande går genom PostgREST och möter alltså `lock_timeout=8s`: det
+-- **faller med ett fel efter åtta sekunder** i stället för att hänga. Migrationen själv kör
+-- som `postgres`, utan lock_timeout, och väntar därför obegränsat på låset. Följden är alltså
+-- inte "långsamt för kunden" utan "fel för kunden, om låset hålls längre än åtta sekunder".
+--
+-- ⚠️ Inget `lock_timeout` sätts i den här filen. Det gör ingen annan fil i `supabase/` heller
+-- (grep: noll träffar), och jag inför inte ett nytt mönster ensidigt i en
+-- dokumentationsmigration. Ska det finnas hör det hemma i `kor-migrationer.yml`, för alla
+-- filer. 👉 Den frågan är Fredriks, och den är ställd — den ligger inte och skräpar här
+-- utan ägare.
+--
+-- ============================ HUR GLAPPET HITTADES ============================
+-- Provet 2026-09-09 (Fredriks kort k-20260906-05, "kör provet lokalt"): hela repot byggdes
+-- till en databas i PGlite, sats för sats, och jämfördes mot drift. Funktioner, policies och
+-- triggers var IDENTISKA — 114 objekt, samma md5. Kolumnerna var det inte:
+--
+--   drift  151 kolumner i public (utan applied_migrations)
+--   repot  150
+--   skillnaden: agreement_acceptances.order_summary
+--
+-- Tidigare kartläggningar missade den för att de jämförde OBJEKT. En kolumn-för-kolumn-diff
+-- var uttryckligen inte gjord — det står i `studio/minne/kunskap-db-mot-repo.md`.
+--
+-- ============================ VARFÖR DET SPELAR ROLL ============================
+-- Kolumnen är inte oanvänd. Två ställen råkar ut för den:
+--
+--   app.js:1725 och :1750   (radnummer på origin/main, kontrollerade där)
+--     skriver order_summary vid båda avtalsvägarna — `approveOffer` och `approveUpdatedOffer`.
+--   supabase/migration-23-notify-published-email.sql:83 och :90
+--     läser new.order_summary i aviseringstriggern.
+--
+-- 🔴 RÄTTAT: version 1 angav app.js-raderna som 2001 och 2048. De siffrorna är mätta i ett
+-- arbetsträd som stod på den OMERGADE grenen `fix/blockera-utan-kontrollsumma` (PR #69), där
+-- de stämmer. På main är det 1725 och 1750. Sakpåståendet höll, koordinaterna gjorde det inte.
+-- ✅ Kontrollerat efteråt att provet ändå mätte rätt filuppsättning: `git diff origin/main
+-- origin/fix/blockera-utan-kontrollsumma -- supabase/` är TOM, så migrationsfilerna som
+-- byggdes var main:s. Det är den kontrollen som gör siffrorna nedan giltiga — inte att jag
+-- tror det.
+--
+-- I en återuppbyggnad ur repot hade alltså avtalsgodkännandet fallit på en okänd kolumn, och
+-- aviseringen med den. Det är `agreement_acceptances` — tabellen som bär beviset för att
+-- kunden godkänt avtalet. Se `studio/minne/kunskap-avtal-villkor.md`.
+--
+-- ============================ KVITTO PÅ MÄTNINGEN ============================
+-- Mot drift (wtekqlkkcomtgizjtqeo) 2026-09-09. Kör om och jämför — påstå ingenting härifrån
+-- utan att ha gjort det:
+--
+--   select column_name, data_type, is_nullable, column_default
+--     from information_schema.columns
+--    where table_schema='public' and table_name='agreement_acceptances'
+--    order by ordinal_position;
+--
+-- Gav nio rader, den nionde:  order_summary | text | YES | (inget default)
+-- Inga kolumn-grants på tabellen (`pg_attribute.attacl` är null överallt), så kolumnen ärver
+-- tabellens grants och repot beskriver behörigheterna även efter den här filen.
+--
+-- 🔴 RÄTTAT (v3): version 2 skrev här *"select count(*) from applied_migrations -> 28, alltså
+-- exakt de 28 filer som ligger i repot"* och drog slutsatsen att kolumnen kom in för hand.
+-- Slutsatsen håller, men BEVISET var fel — och det är precis `baseline`-fällan som står i
+-- `studio/minne/kunskap-supabase-och-agent.md`: en bokföring är inte ett kvitto. Uppmätt:
+--
+--   select applied_by, count(*) from public.applied_migrations group by 1;
+--     baseline              24
+--     kor-migrationer.yml    4     (27, 28, 29, 30)
+--
+-- Tjugofyra av de tjugoåtta är alltså BOKFÖRDA UTAN ATT HA KÖRTS av kedjan. `count(*) = 28`
+-- bevisar bara att inget EXTRA har körts — inte att de 28 kördes.
+--
+-- Det som faktiskt bär slutsatsen är enklare och oberoende av liggaren: **ingen fil i repot
+-- skapar kolumnen**, varken bland de baseline-bokförda eller de körda.
+--
+-- 🔴 RÄTTAT (v4): version 3 skrev här *"`grep -rn order_summary` över hela `studio/` ger tre
+-- träffar … migration 23 en gång"*. Båda talen var fel, och meningen är just den som ERSATTE
+-- det tillbakadragna `count(*)`-beviset — ett bevis som inte reproducerar är inte bättre än
+-- det man tog bort. `studio/` innehåller minnesfiler som numera skriver om saken, så den
+-- omfattningen ger 32 träffar. **Rätt omfattning är portal-repot.** Uppmätt 2026-09-09, i
+-- repots rot, med den här filen undantagen:
+--
+--   git grep -n order_summary -- ':!supabase/migration-35-order-summary.sql'
+--     app.js:1725                                     — skriver
+--     app.js:1750                                     — skriver
+--     supabase/migration-23-notify-published-email.sql:83  — läser
+--     supabase/migration-23-notify-published-email.sql:90  — läser
+--
+-- Fyra träffar i två filer, båda ANVÄNDNINGAR. ⚠️ Använd `git grep`, inte `grep -rn`: repot
+-- saknar `.gitignore`, och `portal/.claude/` är varken spårad eller ignorerad. Ett `grep -rn`
+-- i ett arbetsträd som har den mappen ger FEM träffar — den femte är en agentanteckning som
+-- citerar den här filen. En färsk klon ger fyra. Det är samma reproduktionsdefekt som fällde
+-- v3, en gång till, och den här raden finns för att den inte ska uppstå en tredje gång.
+--
+-- 🔑 **Beviset är LISTAN ovan, inte ett tal.** Fyra träffar, var och en utskriven med
+-- `skriver`/`läser`. Dyker en femte upp syns den i listan och går att läsa. Det är den formen
+-- som bär — inte en räkning, hur robust den än låter.
+--
+-- 🔴 RÄTTAT (v6): version 5 kallade räkningen nedan *"det bärande beviset"* och sa att den
+-- gällde *"oavsett hur många omnämnanden man råkar räkna"*. Den lovar mer än den klarar:
+--   git grep -in "order_summary" -- ':!…' | grep -icE "create|add column"   ->  0
+-- Kontrollen letar `create` eller `add column` **på samma rad som kolumnnamnet**, och en
+-- kolumn som definieras inuti ett `create table (…)`-block står ensam på sin rad utan något
+-- av orden. Den formen är inte hypotetisk: `migration-5-agreements.sql:8-18` definierar just
+-- den här tabellen precis så, en kolumn per rad. Hade `order_summary` legat i det blocket
+-- hade räkningen sagt noll ändå. **Den är alltså ett komplement, inte ett bevis** — den
+-- utesluter en `alter table … add column` någon annanstans, och det är allt.
+--
+-- Konklusionen står: läst för hand är `migration-5:8-18` åtta kolumner utan `order_summary`,
+-- och `schema.sql` innehåller inte tabellen alls. Kolumnen kom in som en lös sats för hand.
+-- Den här filen är det som gör kedjan hel igen.
+--
+-- 📏 Och grenen den finns för används: `select count(*), count(order_summary) from
+-- public.agreement_acceptances` gav **1 av 1** — raden har ett order_summary, så
+-- migration 23:s gren `if new.order_summary is not null` har gått i drift. Kolumnen är alltså
+-- inte bara load-bearing i kod utan bevisat i verkan.
+--
+-- ⚠️ Ingen `not null`, inget default — med flit. Så ser den ut i drift, och en `not null`
+-- hade dessutom fallit på befintliga rader. Skriv inte om den till något "snyggare" än det
+-- som faktiskt kör.
+
+set client_encoding to 'UTF8';
+
+-- 🔴 RÄTTAT: version 1 mätte kolumnens existens EFTER `add column` och kunde därför aldrig
+-- skilja "fanns redan i drift" från "skapades nu i en återuppbyggnad" — de två lägen huvudet
+-- lovade att den skulle skilja. Katalogen ser likadan ut i båda fallen. Både granskaren och
+-- tystnadsgranskaren fann samma sak, oberoende av varandra.
+-- Mätningen måste alltså ske FÖRE.
+--
+-- 🔴 RÄTTAT (v3): version 2 skrev `create temp table _m35_fore as select …` och kallade det
+-- "samma mönster som `_f29_fore` i migration 29". Det var osant, och skillnaden är precis den
+-- härdning 29 blev rättad för — se `migration-29-repot-beskriver-databasen.sql:99-113`. Två
+-- saker, båda med skäl:
+--   * `if not exists` + `delete from` i stället för ett naket `create` — annars dör filen på
+--     `relation "_m35_fore" already exists` vid en OMKÖRNING FÖR HAND, alltså i Supabases
+--     SQL-editor. Det är inte ett hypotetiskt läge: handkörning är den historiska vägen in i
+--     den här databasen, och den troliga vägen i en återuppbyggnad — som är hela skälet till
+--     att den här filen finns. Felmeddelandet hade dessutom handlat om en temptabell i
+--     stället för om det som faktiskt gick fel.
+--     ⚠️ Här stod först "24 av repots migrationer" — den siffran är hämtad ur liggarens
+--     `baseline`-rader, alltså ur samma bokföring som filen fyrtio rader ned förklarar att
+--     man inte ska lita på. Argumentet står utan siffran, så siffran är borta.
+--   * INTE `on commit drop` — körs filen sats för sig commitas `create temp table` för sig,
+--     tabellen släpps omedelbart, och DO-blocket dör på "does not exist".
+-- Under `kor-migrationer.yml` (`psql -1`) kan inget av detta fyra, eftersom ett fel rullar
+-- tillbaka allt. Härdningen är för människan i editorn, inte för CI.
+create temp table if not exists _m35_fore (fanns boolean);
+delete from _m35_fore;
+insert into _m35_fore
+  select exists (
+    select 1 from information_schema.columns
+     where table_schema = 'public'
+       and table_name   = 'agreement_acceptances'
+       and column_name  = 'order_summary'
+  );
+
+alter table public.agreement_acceptances
+  add column if not exists order_summary text;
+
+do $$
+declare
+  v_fanns_innan boolean;
+  v_typ         text;
+begin
+  select fanns into v_fanns_innan from _m35_fore;
+
+  select data_type into v_typ
+    from information_schema.columns
+   where table_schema = 'public'
+     and table_name   = 'agreement_acceptances'
+     and column_name  = 'order_summary';
+
+  if v_typ is null then
+    -- Kan bara inträffa om ALTER-satsen ovan tystnade, vilket den inte kan i samma
+    -- transaktion. Står här ändå: en vakt som bara kontrollerar det förväntade larmar
+    -- aldrig om det oväntade.
+    raise exception 'migration 35: order_summary saknas EFTER add column. Något har stoppat satsen.';
+  end if;
+
+  if v_typ <> 'text' then
+    -- 🔴 RÄTTAT: version 1 hade `raise warning` här. Det var fel kanal för ett fel som inte
+    -- går att komma tillbaka till: `add column if not exists` tiger om kolumnen finns med FEL
+    -- typ, en varning låter psql avsluta med 0, och då bokförs filen och SHA-låses. Den kan
+    -- aldrig köras om automatiskt (`kor-migrationer.yml`), och liggaren skulle påstå att
+    -- glappet är stängt medan repot och drift beskriver olika kolumner — permanent. Samma
+    -- val som `migration-34-kontrollsumma-check.sql` gör för sin efterkontroll.
+    raise exception 'migration 35: order_summary är "%", inte text. Repot och drift beskriver då olika kolumner, och en varning här hade bokfört filen som klar.', v_typ;
+  end if;
+
+  -- Två giltiga lägen, och NU går de att skilja åt. Warning i återuppbyggnadsfallet, för att
+  -- `kor-migrationer.yml` lyfter WARNING till en annotering men låter NOTICE stanna i loggen
+  -- — och "filen gjorde något mot en databas som skulle ha haft kolumnen" är det läge som
+  -- förtjänar att synas.
+  if v_fanns_innan then
+    raise notice 'migration 35: order_summary fanns redan (typ text). No-op, som väntat mot produktion.';
+  else
+    raise warning 'migration 35: order_summary SAKNADES och skapades nu. Väntat i en återuppbyggnad ur repot — ALARMERANDE mot produktion, där den var uppmätt som befintlig 2026-09-09.';
+  end if;
+end $$;
+
+drop table _m35_fore;
