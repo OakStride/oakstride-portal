@@ -28,10 +28,16 @@ node-processen. Ingen tjänst installeras, ingen port öppnas, drift kontaktas a
   en `reset role` (även inuti en DO-kropp) hade gjort en till superuser igen. Nu leder
   `reset role` bara tillbaka till provrollen, som i drift. Efter **varje sats** kontrolleras
   `session_user`, `current_user`, `is_superuser` och `rolsuper`, med schemakvalificerade
-  anrop (`pg_catalog.current_setting`) så att en migration inte kan skugga svaret. Mellan filerna
-  körs `reset all`, eftersom drift kör varje fil i en egen psql-session. Varje rättighet står
-  med sitt skäl i skriptet (`DRIFTROLL_SQL`, `DRIFTROLL_STUBB_SQL`), och allt är mätt i drift
-  2026-09-14:
+  anrop (`pg_catalog.current_setting`) så att en migration inte kan skugga svaret.
+- **En session per fil, som drift.** Drift kör varje fil i en egen psql-session. Mellan filerna
+  körs därför `discard all` (utanför filens transaktion, efter föregående `commit`): temptabeller,
+  prepared statements, cursors, advisory locks och GUC:er följer inte med till nästa fil. Sedan
+  sätts provrollen och drifts `search_path` igen, och vakten kontrollerar rollen före första
+  satsen. `search_path` är mätt i drift (`"$user", public, extensions`, rollens `rolconfig`);
+  eftersom rollinställningar bara gäller vid inloggning sätts den uttryckligen efter varje byte.
+  Kvar som skillnad: `reset search_path` i en fil går här till `"$user", public`.
+- Varje rättighet står med sitt skäl i skriptet (`DRIFTROLL_SQL`, `DRIFTROLL_STUBB_SQL`), och
+  allt är mätt i drift 2026-09-14:
   - attributen och medlemskap i `anon`/`authenticated`/`service_role`;
   - rollen äger databasen (och kan därför skapa i `public`, som ägs av `pg_database_owner`);
   - `auth.users` ägs av `supabase_auth_admin` och `storage.buckets`/`storage.objects` av

@@ -276,6 +276,10 @@ create role ${DRIFTROLL} nosuperuser createrole createdb bypassrls replication n
 -- public. Samma mekanism har: provrollen far aga databasen. Utan raden faller forsta
 -- create table i schema.sql.
 alter database postgres owner to ${DRIFTROLL};
+-- Drift: rolconfig search_path="$user", public, extensions (matt 2026-09-14). Galler har bara
+-- som dokumentation - se blidriftrollen(), som satter den efter varje sessionsbyte.
+create schema if not exists extensions;
+alter role ${DRIFTROLL} set search_path = "$user", public, extensions;
 `;
 const DRIFTROLL_STUBB_SQL = `
 -- Drift: postgres ar medlem i anon, authenticated och service_role (matt 2026-09-14).
@@ -381,6 +385,18 @@ async function vemArJag(db) {
       pg_catalog.current_setting('is_superuser') as su,
       (select r.rolsuper from pg_catalog.pg_roles r where r.rolname OPERATOR(pg_catalog.=) current_user) as rs`)).rows[0];
 }
+// Satter provrollen som sessionsanvandare och dess search_path. search_path ar MATT i drift
+// 2026-09-14: postgres har rolconfig search_path="$user", public, extensions, och det ar ocksa
+// sessionens search_path (databasnivan satter bara app.settings.jwt_exp). Rollinstallningen
+// laggs pa rollen i DRIFTROLL_SQL, men PostgreSQL tillampar rolconfig bara vid inloggning -
+// inte vid SET SESSION AUTHORIZATION - sa den satts uttryckligen har efter varje byte.
+// Skillnad mot drift: en `reset search_path` i en fil gar har till serverns standard
+// ("$user", public), inte till rollens.
+const DRIFT_SEARCH_PATH = '"$user", public, extensions';
+async function blidriftrollen(db) {
+  await db.exec(`set session authorization ${DRIFTROLL}`);
+  await db.exec(`set search_path = ${DRIFT_SEARCH_PATH}`);
+}
 const arDriftrollen = v => v.s === DRIFTROLL && v.u === DRIFTROLL && v.su === 'off' && v.rs === false;
 
 async function kor() {
@@ -436,10 +452,20 @@ async function kor() {
     if (oavslutat) fel.push({ nr: 'filslut', kort: '(hela filen)', fel: oavslutat });
     if (satser.length === 0) fel.push({ nr: '-', kort: '(hela filen)', fel: 'filen ger noll satser - ett prov som inte provade nagot ar inte gront' });
 
-    // Drift kor varje fil i en egen psql-session. En `set search_path` eller annan
-    // installning i en fil ska darfor inte folja med till nasta. RESET ALL ror inte
-    // session authorization.
-    await db.exec('reset all');
+    // Drift kor varje fil i en EGEN psql-session. Inget som lever i en session far darfor
+    // folja med till nasta fil: DISCARD ALL tar bort temptabeller och prepared statements,
+    // stanger cursors, slapper advisory locks, nollstaller GUC:er och gor RESET SESSION
+    // AUTHORIZATION. (RESET ALL, som stod har forut, nollstaller bara GUC:er - en temptabell
+    // eller ett prepare fran fil 30 levde da vidare i fil 31 och gav gront pa nagot som
+    // faller i drift.) DISCARD ALL far inte koras i en transaktion, sa den kors har - efter
+    // foregaende fils COMMIT och fore denna fils BEGIN.
+    await db.exec('discard all');
+    await blidriftrollen(db);
+    const fore = await vemArJag(db);
+    if (!arDriftrollen(fore)) {
+      underkant.push(`${f}: kunde inte bekrafta provrollen fore forsta satsen: ${JSON.stringify(fore)}`);
+      continue;
+    }
     await db.exec('begin');
     for (const [idx, s] of satser.entries()) {
       const nr = idx + 1;
