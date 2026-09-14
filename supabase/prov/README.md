@@ -23,26 +23,31 @@ node-processen. Ingen tjänst installeras, ingen port öppnas, drift kontaktas a
   PGlite förrän drift kör samma huvudversion.
 - **Inte som superuser.** PGlite startar som superuser; drift kör migrationerna som `postgres`,
   som är `NOSUPERUSER CREATEROLE CREATEDB BYPASSRLS REPLICATION` (mätt 2026-09-14). Stubbarna
-  skapas som superuser, sedan körs varje fil under `set role` till en roll med samma attribut.
-  Efter **varje sats** kontrolleras att rollen är kvar och att `is_superuser` är `off`. Varje
-  rättighet står med sitt skäl i skriptet (`DRIFTROLL_SQL`, `DRIFTROLL_STUBB_SQL`):
-  - **Mätt i drift 2026-09-14:** attributen; medlemskap i `anon`/`authenticated`/`service_role`;
-    rollen äger databasen (och kan därför skapa i `public`, som ägs av `pg_database_owner`);
-    `auth.users` ägs av `supabase_auth_admin` och `storage.buckets`/`storage.objects` av
-    `supabase_storage_admin`, som rollen **inte** är medlem i.
-  - **Ur Supabases källkod, inte mätt:** `all` på schema, tabeller, sekvenser och rutiner i
-    `auth`, `extensions`, `storage` (`demote-postgres.sql`), och `all` på `storage.buckets` och
-    `storage.objects` (storage-api `0046`/`0049`). `all` innefattar `TRIGGER`, så
-    `create trigger` på `storage.objects` blir grönt här — kontrollfrågan mot drift står i skriptet.
+  skapas som superuser, sedan körs varje fil under `set session authorization` till en roll med
+  samma attribut — inte `set role`, eftersom sessionsanvändaren då hade förblivit superuser och
+  en `reset role` (även inuti en DO-kropp) hade gjort en till superuser igen. Nu leder
+  `reset role` bara tillbaka till provrollen, som i drift. Efter **varje sats** kontrolleras
+  `session_user`, `current_user`, `is_superuser` och `rolsuper`, med schemakvalificerade
+  anrop (`pg_catalog.current_setting`) så att en migration inte kan skugga svaret. Mellan filerna
+  körs `reset all`, eftersom drift kör varje fil i en egen psql-session. Varje rättighet står
+  med sitt skäl i skriptet (`DRIFTROLL_SQL`, `DRIFTROLL_STUBB_SQL`), och allt är mätt i drift
+  2026-09-14:
+  - attributen och medlemskap i `anon`/`authenticated`/`service_role`;
+  - rollen äger databasen (och kan därför skapa i `public`, som ägs av `pg_database_owner`);
+  - `auth.users` ägs av `supabase_auth_admin` och `storage.buckets`/`storage.objects` av
+    `supabase_storage_admin`, som rollen **inte** är medlem i;
+  - `all` på tabellerna i `auth`, `extensions` och `storage` (`has_table_privilege`, alla sju:
+    SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER). `create trigger` på
+    `storage.objects` blir därför grönt här, som i drift.
 - **supautils efterliknas.** Drift låter `postgres` köra `create/alter/drop policy` och
   `drop trigger` på plattformstabeller den inte äger (`supautils.policy_grants` och
   `drop_trigger_grants`, mätta 2026-09-14; listan står i skriptet). En sats med exakt den
-  formen, schemakvalificerad och mot en tabell i listan, körs av skriptet som superuser och
-  rollen sätts tillbaka direkt efter, även om satsen faller. Allt annat mot de tabellerna —
+  formen, schemakvalificerad och mot en tabell i listan, körs av skriptet som superuser via
+  `db.query` — extended protocol, som vägrar mer än ett kommando per anrop — och rollen sätts
+  tillbaka direkt efter, även om satsen faller. Allt annat mot de tabellerna —
   `alter table ... add column`, `enable row level security` — körs som rollen och faller, som i
   drift. Kan formen inte avgöras säkert körs satsen som rollen: hellre ett onödigt rött än ett
-  falskt grönt. Loggen visar varje sats som fått grant. En `reset role` i själva filen fångas
-  fortfarande av vakten.
+  falskt grönt. Loggen visar varje sats som fått grant.
 - **Ordningen är drifts.** Samma sortering som `kor-migrationer.yml` i `OakStride/oakstride-agent`:
   numeriskt på migrationsnumret (annars kommer 10 före 2), och samma namnkontroll
   (`migration-<siffror>-<gemener-och-bindestreck>.sql`) — ett namn den avbryter på faller här
@@ -51,10 +56,12 @@ node-processen. Ingen tjänst installeras, ingen port öppnas, drift kontaktas a
   transaktionsbundna fel här precis som i drift (t.ex. ett nytt enum-värde som används i samma
   fil), samtidigt som ett fel i sats 3 inte döljer sats 4–17. En fil med egen
   `begin`/`commit` underkänns, eftersom provet då inte kan efterlikna drift troget.
-- **En sats i taget.** Delaren respekterar `'…'`, `"…"`, `$tag$…$tag$`, `--` och `/* */`.
-  Satser som bara består av kommentarer räknas inte. Slutar en fil inuti en oavslutad
-  blockkommentar, sträng, citerad identifierare eller dollar-tagg underkänns filen — annars
-  hade en glömd `*/` gjort resten av filen till en kommentar som tyst filtrerats bort.
+- **En sats i taget.** Delaren följer PostgreSQL:s lexer där det avgör var en sats slutar:
+  `'…'` (bakstreck är ett vanligt tecken, `standard_conforming_strings` på), `E'…'` (bakstreck
+  escapar nästa tecken), `"…"`, `$tag$…$tag$`, `--` och nästlade `/* */`. Satser som bara
+  består av kommentarer räknas inte. Slutar en fil inuti en oavslutad blockkommentar, sträng,
+  citerad identifierare eller dollar-tagg underkänns filen — annars hade en glömd `*/` gjort
+  resten av filen till en kommentar som tyst filtrerats bort.
 - **`onNotice` sätts per fråga** (`db.exec(sql, { onNotice })`). På konstruktorn tystnar varje
   `raise warning` utan felmeddelande. Varningar skrivs ut och lyfts som `::warning::` men
   underkänner inte — migration 27 varnar legitimt om `ensure_rls`.
@@ -79,9 +86,14 @@ utan superuser, **där Supabase-plattformen redan finns** — och inget mer.
   `auth.uid()`, `storage`-schemat och dess funktioner, rollerna `anon`/`authenticated`/
   `service_role`) är **skrivna i skriptet, inte hämtade ur repot**. Utan dem faller provet
   (`--naket`). En riktig Supabase-instans har dem; en vanlig PostgreSQL har det inte.
-- **Inte att rollen är exakt drifts.** Attribut, medlemskap, ägare och supautils-listan är
-  mätta; tabellrättigheterna är hämtade ur Supabases källkod. En rättighet drift saknar men
-  stubben har ger ett grönt prov på något som faller i drift.
+- **Inte att rollen är exakt drifts.** Attribut, medlemskap, ägare, tabellrättigheter och
+  supautils-listan är mätta, men supautils har fler regler än de två listorna, och rättigheter
+  på objekt stubben inte skapar är inte efterliknade.
+- **Inte att en medveten rollflykt fångas.** Den *autentiserade* användaren i PGlite är
+  superuser och går inte att byta (optionen `username` gör bara `SET ROLE`, mätt 2026-09-14).
+  En DO-kropp som kör `set session authorization postgres`, gör något och sedan byter tillbaka
+  till provrollen blir **grön**: vakten mäter bara efter satsen. En flykt som inte återställs
+  fångas; en vanlig `reset role` är ofarlig här, som i drift.
 - **Inte att funktionerna fungerar när de anropas.** PL/pgSQL-kroppar kontrolleras bara
   syntaktiskt när de skapas — en felstavad tabell i en funktion syns först vid anrop. Ingen
   funktion, trigger eller policy körs mot data här. `pg_net` och `vault` saknas helt, så inget

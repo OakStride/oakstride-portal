@@ -15,10 +15,11 @@
 //
 // VEM SOM KOR: PGlite startar som superuser. Drift gor det inte - migrationerna kors dar som
 // rollen postgres, som ar NOSUPERUSER (matt 2026-09-14). Stubbarna skapas darfor som
-// superuser, och varje fil kors sedan under `set role` till en roll som efterliknar drifts
-// postgres (se DRIFTROLL nedan). Efter varje sats kontrolleras att vi fortfarande ar den
-// rollen och att is_superuser ar off - annars hade provet tyst kunnat falla tillbaka till
-// superuser och godkant sadant som faller i drift.
+// superuser, och varje fil kors sedan under `set session authorization` till en roll som
+// efterliknar drifts postgres (se DRIFTROLL nedan). Efter varje sats kontrolleras att vi
+// fortfarande ar den rollen och att is_superuser ar off - annars hade provet tyst kunnat
+// falla tillbaka till superuser och godkant sadant som faller i drift. En medveten flykt
+// inuti en DO-kropp som aterstaller sig sjalv fangas INTE (se rollbytet nedan och README).
 //
 // Exitkod 1 (underkant) om:
 //   * nagon sats faller, utom exakt de satser som star i TILLATNA_FEL nedan,
@@ -61,45 +62,72 @@ function annotera(niva, fil, text) {
 // identifierare eller dollar-tagg ar resten av filen uppslukad - en glomd */ gor annars
 // allt efter den till kommentar, som sedan filtreras bort, och provet blir gront pa en fil
 // som i praktiken ar tom.
+// Lexikala regler som PostgreSQL:s egen lexer, for det som avgor var en sats slutar:
+//   * '...'   vanlig strang. standard_conforming_strings ar pa (default sedan PG 9.1), sa
+//             bakstreck ar ett vanligt tecken; '' ar en apostrof.
+//   * E'...'  escape-strang (E eller e direkt fore apostrofen, och inte sist i ett langre
+//             ord). Bakstreck escapar nasta tecken, sa bakstreck+apostrof avslutar INTE
+//             strangen. Utan den regeln slogs flera satser ihop till en bit - och en bit som
+//             borjar som en supautils-policy kordes da hel som superuser.
+//   * "..."   citerad identifierare; "" ar ett citattecken.
+//   * $tag$   dollar-citat. Inte direkt efter ett identifierartecken (a$b$ ar ett ord).
+//   * /* */   blockkommentarer NASTLAR i PostgreSQL.
+const ORDTECKEN = { test: ch => /[A-Za-z0-9_$]/.test(ch) || ch.charCodeAt(0) >= 128 };
+// Returnerar index direkt efter det citerade/kommenterade som borjar pa i, -1 om det aldrig
+// avslutas, eller null om inget sadant borjar pa i.
+function hoppaOver(sql, i) {
+  const c = sql[i];
+  if (c === '-' && sql[i + 1] === '-') {
+    const n = sql.indexOf('\n', i);
+    return n === -1 ? sql.length : n + 1;
+  }
+  if (c === '/' && sql[i + 1] === '*') {
+    let djup = 1, j = i + 2;
+    while (j < sql.length) {
+      if (sql[j] === '/' && sql[j + 1] === '*') { djup++; j += 2; continue; }
+      if (sql[j] === '*' && sql[j + 1] === '/') { djup--; j += 2; if (djup === 0) return j; continue; }
+      j++;
+    }
+    return -1;
+  }
+  if (c === "'" || c === '"') {
+    const escape = c === "'" && i > 0 && (sql[i - 1] === 'E' || sql[i - 1] === 'e') &&
+      !(i > 1 && ORDTECKEN.test(sql[i - 2]));
+    let j = i + 1;
+    while (j < sql.length) {
+      if (escape && sql[j] === '\\') { j += 2; continue; }
+      if (sql[j] === c && sql[j + 1] === c) { j += 2; continue; }
+      if (sql[j] === c) return j + 1;
+      j++;
+    }
+    return -1;
+  }
+  if (c === '$' && !(i > 0 && ORDTECKEN.test(sql[i - 1]))) {
+    const m = /^\$[A-Za-z_][A-Za-z_0-9]*\$|^\$\$/.exec(sql.slice(i));
+    if (m) {
+      const n = sql.indexOf(m[0], i + m[0].length);
+      return n === -1 ? -1 : n + m[0].length;
+    }
+  }
+  return null;
+}
+function vadBorjar(sql, i) {
+  const c = sql[i];
+  if (c === '/') return 'blockkommentar /*';
+  if (c === '"') return 'citerad identifierare "';
+  if (c === "'") return 'strang \'';
+  return `dollar-tagg ${/^\$[A-Za-z_0-9]*\$/.exec(sql.slice(i))?.[0] ?? '$'}`;
+}
+
 function delaSatser(sql) {
   const ut = [];
   let i = 0, start = 0, oavslutat = null;
   const rad = pos => sql.slice(0, pos).split('\n').length;
   while (i < sql.length) {
     const c = sql[i];
-    if (c === '-' && sql[i + 1] === '-') {
-      const n = sql.indexOf('\n', i);
-      i = n === -1 ? sql.length : n + 1;
-      continue;
-    }
-    if (c === '/' && sql[i + 1] === '*') {
-      const n = sql.indexOf('*/', i + 2);
-      if (n === -1) { oavslutat = `blockkommentar /* fran rad ${rad(i)} avslutas aldrig`; i = sql.length; break; }
-      i = n + 2;
-      continue;
-    }
-    if (c === "'" || c === '"') {
-      const q = c, fran = i;
-      i++;
-      let stangd = false;
-      while (i < sql.length) {
-        if (sql[i] === q && sql[i + 1] === q) { i += 2; continue; }
-        if (sql[i] === q) { i++; stangd = true; break; }
-        i++;
-      }
-      if (!stangd) { oavslutat = `${q === "'" ? 'strang' : 'citerad identifierare'} ${q} fran rad ${rad(fran)} avslutas aldrig`; break; }
-      continue;
-    }
-    if (c === '$') {
-      const m = /^\$[A-Za-z_][A-Za-z_0-9]*\$|^\$\$/.exec(sql.slice(i));
-      if (m) {
-        const tag = m[0];
-        const n = sql.indexOf(tag, i + tag.length);
-        if (n === -1) { oavslutat = `dollar-tagg ${tag} fran rad ${rad(i)} avslutas aldrig`; i = sql.length; break; }
-        i = n + tag.length;
-        continue;
-      }
-    }
+    const hopp = hoppaOver(sql, i);
+    if (hopp === -1) { oavslutat = `${vadBorjar(sql, i)} fran rad ${rad(i)} avslutas aldrig`; i = sql.length; break; }
+    if (hopp !== null) { i = hopp; continue; }
     if (c === ';') {
       const s = sql.slice(start, i).trim();
       if (s) ut.push(s);
@@ -119,14 +147,12 @@ function delaSatser(sql) {
 function utanKommentarer(s) {
   let ut = '', i = 0;
   while (i < s.length) {
-    if (s[i] === '-' && s[i + 1] === '-') { const n = s.indexOf('\n', i); i = n === -1 ? s.length : n + 1; ut += ' '; continue; }
-    if (s[i] === '/' && s[i + 1] === '*') { const n = s.indexOf('*/', i + 2); i = n === -1 ? s.length : n + 2; ut += ' '; continue; }
-    if (s[i] === "'" || s[i] === '"') {
-      const q = s[i]; let j = i + 1;
-      while (j < s.length) { if (s[j] === q && s[j + 1] === q) { j += 2; continue; } if (s[j] === q) { j++; break; } j++; }
-      ut += s.slice(i, j); i = j; continue;
-    }
-    ut += s[i]; i++;
+    const hopp = hoppaOver(s, i);
+    if (hopp === null) { ut += s[i]; i++; continue; }
+    const slut = hopp === -1 ? s.length : hopp;
+    const kommentar = (s[i] === '-' && s[i + 1] === '-') || (s[i] === '/' && s[i + 1] === '*');
+    ut += kommentar ? ' ' : s.slice(i, slut);
+    i = slut;
   }
   return ut.replace(/\s+/g, ' ').trim();
 }
@@ -267,22 +293,17 @@ alter table auth.users owner to supabase_auth_admin;
 alter table storage.buckets owner to supabase_storage_admin;
 alter table storage.objects owner to supabase_storage_admin;
 
--- Rattigheterna nedan ar ORDAGRANT de Supabase ger postgres nar rollen degraderas fran
--- superuser: supabase/postgres migrations/db/migrations/10000000000000_demote-postgres.sql
---   GRANT ALL ON SCHEMA auth/extensions/storage TO postgres;
---   GRANT ALL ON ALL TABLES|SEQUENCES|ROUTINES IN SCHEMA auth/extensions/storage TO postgres;
--- Repot behover dem i drift for: foreign key mot auth.users (REFERENCES) och triggern
+-- Tabellrattigheterna ar MATTA I DRIFT 2026-09-14 (has_table_privilege, alla sju: SELECT,
+-- INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER) for postgres pa auth.users,
+-- storage.objects, storage.buckets och ovriga auth- och storage-tabeller. Undantagen i drift
+-- - auth.schema_migrations, storage.migrations, storage.buckets_vectors och
+-- storage.vector_indexes, som bara har SELECT - finns inte i stubben. Samma rattigheter
+-- delas ut av Supabases egna skript: supabase/postgres 10000000000000_demote-postgres.sql
+-- och supabase/storage migrations/tenant/0046 och 0049.
+-- Repot behover dem for: foreign key mot auth.users (REFERENCES) och triggern
 -- on_auth_user_created pa auth.users (TRIGGER) i schema.sql, samt insert i storage.buckets
--- i migration 19. Utan dem faller schema.sql med "permission denied for schema auth", vilket
--- den inte gor i drift.
--- For storage.buckets och storage.objects ger Supabase dessutom uttryckligen ALL till
--- postgres i storage-api:s egna migrationer (supabase/storage migrations/tenant/
--- 0046-buckets-objects-grants.sql och 0049-buckets-objects-grants-postgres.sql:
--- "grant all on storage.buckets, storage.objects to postgres with grant option").
--- ALL innefattar TRIGGER, sa "create trigger ... on storage.objects" gar igenom har.
--- OMATT i drift: kontrollera med
---   select has_table_privilege('postgres', 'storage.objects', 'TRIGGER');
--- Ger den false ska storage-grants snavas av till det migration 19 behover.
+-- i migration 19. TRIGGER pa storage.objects innebar att "create trigger ... on
+-- storage.objects" gar igenom har - som i drift.
 grant all on schema auth, extensions, storage to ${DRIFTROLL};
 grant all on all tables in schema auth, extensions, storage to ${DRIFTROLL};
 grant all on all sequences in schema auth, extensions, storage to ${DRIFTROLL};
@@ -298,10 +319,11 @@ grant all on all routines in schema auth, extensions, storage to ${DRIFTROLL};
 //
 // Efterlikningen: en sats vars form sakert ar create/alter/drop policy ... on <schema>.<tabell>
 // (eller drop trigger ... on <schema>.<tabell>) med tabellen i listan kors av skriptet som
-// superuser (reset role), och rollen sats tillbaka direkt efter, aven om satsen faller.
+// superuser (set session authorization), och rollen sats tillbaka direkt efter, aven om
+// satsen faller. Satsen kors med db.query, som vagrar mer an ett kommando per anrop.
 // Tolkningen ar KONSERVATIV: tabellen maste vara schemakvalificerad och satsen maste matcha
 // formen exakt. Kan den inte avgoras kors satsen som provrollen - ett onodigt rott ar battre
-// an ett falskt gront. Filens egen `reset role` ar aldrig en sadan form och fangas av vakten.
+// an ett falskt gront.
 const SUPAUTILS_TABELLER = [
   'auth.audit_log_entries', 'auth.flow_state', 'auth.identities', 'auth.instances',
   'auth.mfa_amr_claims', 'auth.mfa_challenges', 'auth.mfa_factors', 'auth.oauth_clients',
@@ -331,26 +353,35 @@ function supautilsGrant(sats) {
 }
 
 // ----------------------------------------------------------------- inventering (drift)
-// SAMMA uttryck som receptets drift-SQL, tecken for tecken i det som raknas och sorteras,
-// sa att en manniska kan kora dem mot drift och jamfora raderna. Jamforelsen gors INTE har.
-const SQL_OBJEKT = `select count(*)::int as antal, md5(string_agg(x, '|' order by x collate "C")) as md5 from (
-  select 'F '||p.proname||'('||pg_get_function_identity_arguments(p.oid)||')' as x
-    from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='public'
+// SAMMA uttryck som receptets drift-SQL i det som raknas och sorteras, sa att en manniska kan
+// kora README:s version mot drift och jamfora raderna. Har ar funktioner och katalogtabeller
+// schemakvalificerade (pg_catalog.) - det andrar inte resultatet, bara att en migration inte
+// kan skugga dem. Jamforelsen gors INTE har.
+const SQL_OBJEKT = `select pg_catalog.count(*)::int as antal, pg_catalog.md5(pg_catalog.string_agg(x, '|' order by x collate "C")) as md5 from (
+  select 'F '||p.proname||'('||pg_catalog.pg_get_function_identity_arguments(p.oid)||')' as x
+    from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid=p.pronamespace where n.nspname='public'
   union all select 'P '||schemaname||'.'||tablename||'.'||policyname
-    from pg_policies where schemaname in ('public','storage')
+    from pg_catalog.pg_policies where schemaname in ('public','storage')
   union all select 'T '||c.relname||'.'||tgname
-    from pg_trigger t join pg_class c on c.oid=t.tgrelid
-    join pg_namespace n on n.oid=c.relnamespace where not t.tgisinternal and n.nspname='public'
+    from pg_catalog.pg_trigger t join pg_catalog.pg_class c on c.oid=t.tgrelid
+    join pg_catalog.pg_namespace n on n.oid=c.relnamespace where not t.tgisinternal and n.nspname='public'
 ) a`;
-const SQL_KOLUMNER = `select count(*)::int as antal, md5(string_agg(x, '|' order by x collate "C")) as md5 from (
+const SQL_KOLUMNER = `select pg_catalog.count(*)::int as antal, pg_catalog.md5(pg_catalog.string_agg(x, '|' order by x collate "C")) as md5 from (
   select table_name||'.'||column_name||' '||data_type||' '||is_nullable as x
     from information_schema.columns
    where table_schema='public' and table_name <> 'applied_migrations') a`;
 
 // -------------------------------------------------------------------------------- kor
+// Vaktfragan. Allt schemakvalificerat, aven operatorn: en migration kan skapa
+// public.current_setting(text) och satta search_path = public, pg_catalog, och en
+// okvalificerad fraga hade da kunnat svara 'off'. session_user och current_user ar SQL-
+// nyckelord och gar inte att skugga. rolsuper mats dessutom oberoende av GUC:en.
 async function vemArJag(db) {
-  return (await db.query(`select current_user as u, current_setting('is_superuser') as su`)).rows[0];
+  return (await db.query(`select session_user as s, current_user as u,
+      pg_catalog.current_setting('is_superuser') as su,
+      (select r.rolsuper from pg_catalog.pg_roles r where r.rolname OPERATOR(pg_catalog.=) current_user) as rs`)).rows[0];
 }
+const arDriftrollen = v => v.s === DRIFTROLL && v.u === DRIFTROLL && v.su === 'off' && v.rs === false;
 
 async function kor() {
   const filer = filordning();
@@ -375,16 +406,26 @@ async function kor() {
 
   // Byt till driftrollen och BEKRAFTA det. Ett rollbyte som inte gick igenom hade annars
   // latit hela provet kora som superuser utan att nagot sa till.
-  await db.exec(`set role ${DRIFTROLL}`);
+  //
+  // SET SESSION AUTHORIZATION, inte SET ROLE. Med set role ar sessionsanvandaren kvar som
+  // superuser, och en `reset role` - aven inuti en DO-kropp - gor en till superuser igen.
+  // Efter set session authorization ar aven sessionsanvandaren driftrollen, och reset role
+  // leder tillbaka till den. PGlite kan inte starta med en annan sessionsanvandare: optionen
+  // `username` gor bara SET ROLE (matt 2026-09-14: session_user forblev postgres).
+  // KVARSTAENDE LUCKA: den AUTENTISERADE anvandaren ar fortfarande superuser, sa en medveten
+  // `set session authorization <superuser>` inuti en DO-kropp som sedan byter tillbaka fangas
+  // inte - vakten mater bara efter satsen. Se README.
+  const SUPERUSER = (await db.query('select session_user as s')).rows[0].s;
+  await db.exec(`set session authorization ${DRIFTROLL}`);
   const jag = await vemArJag(db);
-  if (jag.u !== DRIFTROLL || jag.su !== 'off') {
-    underkant.push(`Rollbytet gick inte att bekrafta: current_user=${jag.u}, is_superuser=${jag.su}`);
+  if (!arDriftrollen(jag)) {
+    underkant.push(`Rollbytet gick inte att bekrafta: ${JSON.stringify(jag)}`);
     return null;
   }
 
   console.log(`Läge: ${NAKET ? 'naket (inte grinden)' : 'stubbar (grinden)'}`);
   console.log(`PostgreSQL: ${(await db.query('select version() as v')).rows[0].v}`);
-  console.log(`Kör som: ${jag.u} (is_superuser=${jag.su})`);
+  console.log(`Kör som: session_user=${jag.s}, current_user=${jag.u} (is_superuser=${jag.su}, rolsuper=${jag.rs})`);
   console.log(`Ordning (${filer.length} filer): ${filer.join(', ')}\n`);
 
   let totalt = 0, gronaTotalt = 0, tillatnaTotalt = 0, supautilsSatser = 0;
@@ -395,6 +436,10 @@ async function kor() {
     if (oavslutat) fel.push({ nr: 'filslut', kort: '(hela filen)', fel: oavslutat });
     if (satser.length === 0) fel.push({ nr: '-', kort: '(hela filen)', fel: 'filen ger noll satser - ett prov som inte provade nagot ar inte gront' });
 
+    // Drift kor varje fil i en egen psql-session. En `set search_path` eller annan
+    // installning i en fil ska darfor inte folja med till nasta. RESET ALL ror inte
+    // session authorization.
+    await db.exec('reset all');
     await db.exec('begin');
     for (const [idx, s] of satser.entries()) {
       const nr = idx + 1;
@@ -410,29 +455,37 @@ async function kor() {
       if (grant) { supautilsSatser++; medGrant.push(`sats ${nr} (${grant})`); }
       await db.exec('savepoint sats');
       try {
-        if (grant) await db.exec('reset role');
-        try {
+        if (grant) {
+          await db.exec(`set session authorization ${SUPERUSER}`);
+          try {
+            // db.query = extended protocol, som VAGRAR mer an ett kommando i ett anrop
+            // ("cannot insert multiple commands into a prepared statement"). Har delaren
+            // nagonsin slagit ihop tva satser till en bit kors alltsa ingenting som superuser.
+            await db.query(s, [], { onNotice });
+          } finally {
+            // Faller satsen ar transaktionen avbruten och kommandot gar inte - da aterstaller
+            // rollback to savepoint rollen, och bytet kors igen efter den nedan.
+            try { await db.exec(`set session authorization ${DRIFTROLL}`); } catch { /* se ovan */ }
+          }
+        } else {
           await db.exec(s, { onNotice });
-        } finally {
-          // Faller satsen ar transaktionen avbruten och set role gar inte - da aterstaller
-          // rollback to savepoint rollen, och set role kors igen efter den nedan.
-          if (grant) { try { await db.exec(`set role ${DRIFTROLL}`); } catch { /* se ovan */ } }
         }
         await db.exec('release savepoint sats');
         grona++;
       } catch (e) {
         await db.exec('rollback to savepoint sats');
         await db.exec('release savepoint sats');
-        if (grant) await db.exec(`set role ${DRIFTROLL}`);
+        if (grant) await db.exec(`set session authorization ${DRIFTROLL}`);
         const t = tillatet(s);
         if (t) tillatna.push({ nr, kort, fel: e.message.split('\n')[0], skal: t.skal });
         else fel.push({ nr, kort, fel: e.message.split('\n')[0] });
       }
       // Vakten: efter VARJE sats ska vi fortfarande vara driftrollen, utan superuser.
       const v = await vemArJag(db);
-      if (v.u !== DRIFTROLL || v.su !== 'off') {
-        fel.push({ nr, kort, fel: `satsen lamnade provet som current_user=${v.u}, is_superuser=${v.su} - drift kor aldrig som superuser` });
-        await db.exec(`set role ${DRIFTROLL}`);
+      if (!arDriftrollen(v)) {
+        fel.push({ nr, kort, fel: `satsen lamnade provet som session_user=${v.s}, current_user=${v.u}, is_superuser=${v.su}, rolsuper=${v.rs} - drift kor aldrig som superuser` });
+        await db.exec(`set session authorization ${SUPERUSER}`);
+        await db.exec(`set session authorization ${DRIFTROLL}`);
       }
     }
     // COMMIT kan sjalv falla (t.ex. uppskjutna constraints). Det ar ett fel i filen.
@@ -460,14 +513,19 @@ async function kor() {
 
   if (totalt === 0) underkant.push('Noll satser kordes. Ett prov som inte provade nagot ar inte gront.');
 
-  await db.exec('reset role');
+  // Inventeringen som superuser, med search_path = bara pg_catalog, sa att ingen funktion
+  // eller operator som en migration lagt i public kan skugga det som raknas. Funktionerna ar
+  // dessutom schemakvalificerade.
+  await db.exec(`set session authorization ${SUPERUSER}`);
+  await db.exec('reset all');
+  await db.exec('set search_path to pg_catalog');
   const antal = async q => (await db.query(q)).rows[0].n;
   const inv = {
-    funktioner_public: await antal(`select count(*)::int as n from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='public'`),
-    policies_public_storage: await antal(`select count(*)::int as n from pg_policies where schemaname in ('public','storage')`),
-    triggers_public: await antal(`select count(*)::int as n from pg_trigger t join pg_class c on c.oid=t.tgrelid join pg_namespace n on n.oid=c.relnamespace where not t.tgisinternal and n.nspname='public'`),
-    kolumner_public: await antal(`select count(*)::int as n from information_schema.columns where table_schema='public' and table_name <> 'applied_migrations'`),
-    event_triggers: await antal(`select count(*)::int as n from pg_event_trigger`),
+    funktioner_public: await antal(`select pg_catalog.count(*)::int as n from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid=p.pronamespace where n.nspname='public'`),
+    policies_public_storage: await antal(`select pg_catalog.count(*)::int as n from pg_catalog.pg_policies where schemaname in ('public','storage')`),
+    triggers_public: await antal(`select pg_catalog.count(*)::int as n from pg_catalog.pg_trigger t join pg_catalog.pg_class c on c.oid=t.tgrelid join pg_catalog.pg_namespace n on n.oid=c.relnamespace where not t.tgisinternal and n.nspname='public'`),
+    kolumner_public: await antal(`select pg_catalog.count(*)::int as n from information_schema.columns where table_schema='public' and table_name <> 'applied_migrations'`),
+    event_triggers: await antal(`select pg_catalog.count(*)::int as n from pg_catalog.pg_event_trigger`),
   };
   const objekt = (await db.query(SQL_OBJEKT)).rows[0];
   const kolumner = (await db.query(SQL_KOLUMNER)).rows[0];
