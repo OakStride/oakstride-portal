@@ -13,15 +13,26 @@
 //   --naket   = ingenting forutsatt utover tom Postgres. Svarar pa en annan fraga och ar
 //               inte grinden - den faller i dag, och det ar ett kant lage.
 //
+// VEM SOM KOR: PGlite startar som superuser. Drift gor det inte - migrationerna kors dar som
+// rollen postgres, som ar NOSUPERUSER (matt 2026-09-14). Stubbarna skapas darfor som
+// superuser, och varje fil kors sedan under `set role` till en roll som efterliknar drifts
+// postgres (se DRIFTROLL nedan). Efter varje sats kontrolleras att vi fortfarande ar den
+// rollen och att is_superuser ar off - annars hade provet tyst kunnat falla tillbaka till
+// superuser och godkant sadant som faller i drift.
+//
 // Exitkod 1 (underkant) om:
-//   * nagon sats faller, utom de uttryckligen tillatna i TILLATNA_FEL nedan,
-//   * nagon stubbsats faller,
-//   * schema.sql saknas, ingen migrationsfil hittas, eller noll satser kordes,
+//   * nagon sats faller, utom exakt de satser som star i TILLATNA_FEL nedan,
+//   * nagon stubbsats faller, eller rollbytet inte gar att bekrafta,
+//   * schema.sql saknas eller ingen migrationsfil hittas,
+//   * en fil ger noll satser (t.ex. tomd till en kommentar),
+//   * en fil slutar inuti en blockkommentar, strang, citerad identifierare eller dollar-tagg,
 //   * ett migrationsfilnamn inte foljer monstret kor-migrationer.yml kraver,
 //   * en fil innehaller egen transaktionskontroll (se TRANSAKTION nedan),
+//   * en sats byter roll eller blir superuser,
 //   * nagot ovantat kastas.
 // `raise warning` och `raise notice` skrivs ut men underkanner inte: migration 27 varnar
-// legitimt om ensure_rls, som kraver superuser.
+// legitimt om ensure_rls, som kraver superuser. En warning om ett verkligt problem blir
+// alltsa gron har - precis som i drift.
 
 import { PGlite } from '@electric-sql/pglite';
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
@@ -46,9 +57,14 @@ function annotera(niva, fil, text) {
 // ---------------------------------------------------------------------------- satsdelning
 // Respekterar '...', "...", $tag$...$tag$, -- rad och /* block */. En naiv split pa ';'
 // hade delat mitt i varje funktionskropp.
+// Returnerar ocksa `oavslutat`: slutar filen inuti en blockkommentar, strang, citerad
+// identifierare eller dollar-tagg ar resten av filen uppslukad - en glomd */ gor annars
+// allt efter den till kommentar, som sedan filtreras bort, och provet blir gront pa en fil
+// som i praktiken ar tom.
 function delaSatser(sql) {
   const ut = [];
-  let i = 0, start = 0;
+  let i = 0, start = 0, oavslutat = null;
+  const rad = pos => sql.slice(0, pos).split('\n').length;
   while (i < sql.length) {
     const c = sql[i];
     if (c === '-' && sql[i + 1] === '-') {
@@ -58,17 +74,20 @@ function delaSatser(sql) {
     }
     if (c === '/' && sql[i + 1] === '*') {
       const n = sql.indexOf('*/', i + 2);
-      i = n === -1 ? sql.length : n + 2;
+      if (n === -1) { oavslutat = `blockkommentar /* fran rad ${rad(i)} avslutas aldrig`; i = sql.length; break; }
+      i = n + 2;
       continue;
     }
     if (c === "'" || c === '"') {
-      const q = c;
+      const q = c, fran = i;
       i++;
+      let stangd = false;
       while (i < sql.length) {
         if (sql[i] === q && sql[i + 1] === q) { i += 2; continue; }
-        if (sql[i] === q) { i++; break; }
+        if (sql[i] === q) { i++; stangd = true; break; }
         i++;
       }
+      if (!stangd) { oavslutat = `${q === "'" ? 'strang' : 'citerad identifierare'} ${q} fran rad ${rad(fran)} avslutas aldrig`; break; }
       continue;
     }
     if (c === '$') {
@@ -76,7 +95,8 @@ function delaSatser(sql) {
       if (m) {
         const tag = m[0];
         const n = sql.indexOf(tag, i + tag.length);
-        i = n === -1 ? sql.length : n + tag.length;
+        if (n === -1) { oavslutat = `dollar-tagg ${tag} fran rad ${rad(i)} avslutas aldrig`; i = sql.length; break; }
+        i = n + tag.length;
         continue;
       }
     }
@@ -91,7 +111,7 @@ function delaSatser(sql) {
   const rest = sql.slice(start).trim();
   if (rest) ut.push(rest);
   // En "sats" som bara bestar av kommentarer ar ingen sats.
-  return ut.filter(s => utanKommentarer(s) !== '');
+  return { satser: ut.filter(s => utanKommentarer(s) !== ''), oavslutat };
 }
 
 // Tar bort -- och /* */ utanfor strangar, och normaliserar blanksteg. Anvands for att
@@ -115,14 +135,12 @@ function utanKommentarer(s) {
 // UTTRYCKLIG, NAMNGIVEN lista. Matchar pa HELA satsen (gemener, kommentarer bort,
 // blanksteg normaliserade) - aldrig pa felmeddelandet. Ett generellt monster som
 // "extension ... finns inte" hade slappt igenom varje framtida extension-fel.
+// Bara EXAKT den sats som star i schema.sql. `create extension pg_net` utan if not exists
+// finns inte har med flit: den faller i drift, dar pg_net redan finns.
 const TILLATNA_FEL = [
   {
     sats: 'create extension if not exists pg_net',
     skal: 'pg_net finns inte i PGlite. Det ar provmiljons brist, inte repots - pa Supabase finns den.',
-  },
-  {
-    sats: 'create extension pg_net',
-    skal: 'Samma som ovan, utan if not exists.',
   },
 ];
 function tillatet(sats) {
@@ -177,7 +195,7 @@ function filordning() {
 // ---------------------------------------------------------------------------- stubbar
 // VARA EGNA, inte hamtade ur repot. De ersatter det Supabase-plattformen har pa plats innan
 // en enda av repots filer kors. Att repot gar igenom med dem bevisar alltsa inte att repot
-// racker utan plattformen.
+// racker utan plattformen. Skapas som SUPERUSER, som plattformen gor.
 const STUBBAR = `
 create schema if not exists auth;
 create schema if not exists storage;
@@ -215,6 +233,56 @@ create or replace function storage.extension(name text) returns text
   language sql immutable as $x$ select nullif(split_part(name, '.', 2), '') $x$;
 `;
 
+// ------------------------------------------------------------------------- driftroll
+// Efterliknar rollen postgres i drift, matt 2026-09-14:
+//   rolsuper=false, rolcreaterole=true, rolcreatedb=true, rolbypassrls=true, rolreplication=true
+//   medlem i anon, authenticated, service_role (m.fl.)
+//   schemat public ags av pg_database_owner; tabeller och funktioner i public ags av postgres.
+// Varje rattighet utover attributen star har med sitt skal. En rattighet som bara finns for
+// att fa gront, utan motivering mot drift, hor inte hemma har.
+const DRIFTROLL = 'prov_drift_postgres';
+const DRIFTROLL_SQL = `
+create role ${DRIFTROLL} nosuperuser createrole createdb bypassrls replication nologin;
+-- Drift: tabeller och funktioner i public ags av postgres (matt 2026-09-14), alltsa kan
+-- postgres skapa i public. Hur (databasagare och darmed medlem i pg_database_owner, som ager
+-- public - eller en GRANT) ar INTE matt. Samma effekt ges har med en uttrycklig USAGE +
+-- CREATE. Supabase ger postgres USAGE pa public (supabase/postgres init-scripts/
+-- 00000000000000-initial-schema.sql). Utan raden faller forsta create table i schema.sql.
+grant usage, create on schema public to ${DRIFTROLL};
+`;
+const DRIFTROLL_STUBB_SQL = `
+-- Drift: postgres ar medlem i anon, authenticated och service_role (matt 2026-09-14).
+-- Behovs for att postgres ska kunna ge rattigheter till och agera som dem.
+grant anon, authenticated, service_role to ${DRIFTROLL};
+
+-- Agare som i Supabase: auth.users ags av supabase_auth_admin (supabase/postgres
+-- init-scripts/00000000000001-auth-schema.sql).
+alter table auth.users owner to supabase_auth_admin;
+
+-- storage.objects ags av driftrollen. HARLEDD, INTE MATT: create policy kraver att man ager
+-- tabellen (ingen GRANT racker), och drift HAR de tre policies migration 19 skapar pa
+-- storage.objects - de ingar i objektlistans 114 objekt och md5 cb8e3bea... (utan dem blir
+-- det 111). postgres ar inte superuser och inte medlem i supabase_storage_admin (matt
+-- 2026-09-14), sa i drift maste postgres aga storage.objects. Utan raden faller migration 19
+-- med "must be owner of table objects". Kontrollera mot drift med:
+--   select tableowner from pg_tables where schemaname='storage' and tablename='objects';
+-- Visar den nagot annat an postgres ar raden fel och ska bort.
+alter table storage.objects owner to ${DRIFTROLL};
+
+-- Rattigheterna nedan ar ORDAGRANT de Supabase ger postgres nar rollen degraderas fran
+-- superuser: supabase/postgres migrations/db/migrations/10000000000000_demote-postgres.sql
+--   GRANT ALL ON SCHEMA auth/extensions/storage TO postgres;
+--   GRANT ALL ON ALL TABLES|SEQUENCES|ROUTINES IN SCHEMA auth/extensions/storage TO postgres;
+-- Repot behover dem i drift for: foreign key mot auth.users (REFERENCES) och triggern
+-- on_auth_user_created pa auth.users (TRIGGER) i schema.sql, samt insert i storage.buckets
+-- i migration 19. Utan dem faller schema.sql med "permission denied for schema auth", vilket
+-- den inte gor i drift.
+grant all on schema auth, extensions, storage to ${DRIFTROLL};
+grant all on all tables in schema auth, extensions, storage to ${DRIFTROLL};
+grant all on all sequences in schema auth, extensions, storage to ${DRIFTROLL};
+grant all on all routines in schema auth, extensions, storage to ${DRIFTROLL};
+`;
+
 // ----------------------------------------------------------------- inventering (drift)
 // SAMMA uttryck som receptets drift-SQL, tecken for tecken i det som raknas och sorteras,
 // sa att en manniska kan kora dem mot drift och jamfora raderna. Jamforelsen gors INTE har.
@@ -233,6 +301,10 @@ const SQL_KOLUMNER = `select count(*)::int as antal, md5(string_agg(x, '|' order
    where table_schema='public' and table_name <> 'applied_migrations') a`;
 
 // -------------------------------------------------------------------------------- kor
+async function vemArJag(db) {
+  return (await db.query(`select current_user as u, current_setting('is_superuser') as su`)).rows[0];
+}
+
 async function kor() {
   const filer = filordning();
   if (underkant.length) return null;
@@ -245,24 +317,36 @@ async function kor() {
   const notiser = [];
   const onNotice = n => notiser.push({ niva: n.severity, text: n.message });
 
-  if (!NAKET) {
-    for (const s of delaSatser(STUBBAR)) {
-      try { await db.exec(s, { onNotice }); }
-      catch (e) { underkant.push(`Stubbsats föll: ${utanKommentarer(s).slice(0, 80)} -> ${e.message}`); }
-    }
-    notiser.splice(0);
-    if (underkant.length) return null;
+  // Plattformen: som superuser.
+  const plattform = (NAKET ? '' : STUBBAR) + DRIFTROLL_SQL + (NAKET ? '' : DRIFTROLL_STUBB_SQL);
+  for (const s of delaSatser(plattform).satser) {
+    try { await db.exec(s, { onNotice }); }
+    catch (e) { underkant.push(`Plattformssats föll: ${utanKommentarer(s).slice(0, 80)} -> ${e.message}`); }
+  }
+  notiser.splice(0);
+  if (underkant.length) return null;
+
+  // Byt till driftrollen och BEKRAFTA det. Ett rollbyte som inte gick igenom hade annars
+  // latit hela provet kora som superuser utan att nagot sa till.
+  await db.exec(`set role ${DRIFTROLL}`);
+  const jag = await vemArJag(db);
+  if (jag.u !== DRIFTROLL || jag.su !== 'off') {
+    underkant.push(`Rollbytet gick inte att bekrafta: current_user=${jag.u}, is_superuser=${jag.su}`);
+    return null;
   }
 
   console.log(`Läge: ${NAKET ? 'naket (inte grinden)' : 'stubbar (grinden)'}`);
   console.log(`PostgreSQL: ${(await db.query('select version() as v')).rows[0].v}`);
+  console.log(`Kör som: ${jag.u} (is_superuser=${jag.su})`);
   console.log(`Ordning (${filer.length} filer): ${filer.join(', ')}\n`);
 
   let totalt = 0, gronaTotalt = 0, tillatnaTotalt = 0;
   for (const f of filer) {
-    const satser = delaSatser(readFileSync(path.join(SQLDIR, f), 'utf8'));
+    const { satser, oavslutat } = delaSatser(readFileSync(path.join(SQLDIR, f), 'utf8'));
     let grona = 0;
     const fel = [], tillatna = [];
+    if (oavslutat) fel.push({ nr: 'filslut', kort: '(hela filen)', fel: oavslutat });
+    if (satser.length === 0) fel.push({ nr: '-', kort: '(hela filen)', fel: 'filen ger noll satser - ett prov som inte provade nagot ar inte gront' });
 
     await db.exec('begin');
     for (const [idx, s] of satser.entries()) {
@@ -284,6 +368,12 @@ async function kor() {
         const t = tillatet(s);
         if (t) tillatna.push({ nr, kort, fel: e.message.split('\n')[0], skal: t.skal });
         else fel.push({ nr, kort, fel: e.message.split('\n')[0] });
+      }
+      // Vakten: efter VARJE sats ska vi fortfarande vara driftrollen, utan superuser.
+      const v = await vemArJag(db);
+      if (v.u !== DRIFTROLL || v.su !== 'off') {
+        fel.push({ nr, kort, fel: `satsen lamnade provet som current_user=${v.u}, is_superuser=${v.su} - drift kor aldrig som superuser` });
+        await db.exec(`set role ${DRIFTROLL}`);
       }
     }
     // COMMIT kan sjalv falla (t.ex. uppskjutna constraints). Det ar ett fel i filen.
@@ -310,12 +400,14 @@ async function kor() {
 
   if (totalt === 0) underkant.push('Noll satser kordes. Ett prov som inte provade nagot ar inte gront.');
 
+  await db.exec('reset role');
   const antal = async q => (await db.query(q)).rows[0].n;
   const inv = {
     funktioner_public: await antal(`select count(*)::int as n from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='public'`),
     policies_public_storage: await antal(`select count(*)::int as n from pg_policies where schemaname in ('public','storage')`),
     triggers_public: await antal(`select count(*)::int as n from pg_trigger t join pg_class c on c.oid=t.tgrelid join pg_namespace n on n.oid=c.relnamespace where not t.tgisinternal and n.nspname='public'`),
     kolumner_public: await antal(`select count(*)::int as n from information_schema.columns where table_schema='public' and table_name <> 'applied_migrations'`),
+    event_triggers: await antal(`select count(*)::int as n from pg_event_trigger`),
   };
   const objekt = (await db.query(SQL_OBJEKT)).rows[0];
   const kolumner = (await db.query(SQL_KOLUMNER)).rows[0];
@@ -327,6 +419,7 @@ async function kor() {
   console.log(`policies i public+storage:     ${inv.policies_public_storage}`);
   console.log(`triggers i public:             ${inv.triggers_public}`);
   console.log(`kolumner i public:             ${inv.kolumner_public}`);
+  console.log(`event triggers:                ${inv.event_triggers}`);
   console.log(`objektlistan (F+P+T):          ${objekt.antal} objekt, md5 ${objekt.md5}`);
   console.log(`kolumnlistan:                  ${kolumner.antal} kolumner, md5 ${kolumner.md5}`);
   await db.close();

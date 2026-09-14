@@ -8,6 +8,6 @@
     "prov": "node bygg-ur-repot.mjs .."
   },
   "dependencies": {
-    "@electric-sql/pglite": "0.5.8"
+    "@electric-sql/pglite": "0.4.6"
   }
 }
