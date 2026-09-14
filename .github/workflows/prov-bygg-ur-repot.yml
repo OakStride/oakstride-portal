@@ -1,0 +1,60 @@
+name: Prov - bygg databasen ur repot
+
+# Issue #60: "Kunna bygga upp databasen ur repot".
+#
+# VARFOR DEN FINNS
+# Migrationerna kors mot drift av kor-migrationer.yml i OakStride/oakstride-agent - efter
+# merge. Grinden ar PR:en, men ingenting provade pa PR:en att filerna gar att kora i foljd pa
+# en tom databas, och schema.sql kordes aldrig av nagon CI alls. Det har jobbet gor det:
+# schema.sql och sedan migration-N-*.sql, i samma ordning och med samma namnkontroll som
+# kor-migrationer.yml, i en PostgreSQL som lever i minnet i jobbet (PGlite, PG 17 som drift),
+# under en roll utan superuser som efterliknar drifts postgres.
+#
+# VAD DEN INTE GOR: den ror aldrig drift, behover inga secrets och jamfor inte mot drift.
+# Vad ett gront utfall INTE bevisar star i supabase/prov/README.md - las det innan du
+# lutar dig mot ett gront kryss.
+
+# INGET paths-FILTER, MED FLIT. Lagg inte tillbaka det.
+# Provet ar tankt som obligatorisk check i grenskyddet. En obligatorisk check som hoppas
+# over pa grund av paths rapporterar aldrig nagon status, och PR:en blir kvar pa
+# "Expected - Waiting for status to be reported" - den gar da aldrig att merga. Det hade
+# drabbat varje PR som bara ror t.ex. app.js (portal#67, #68). Korningen tar ~10 s och repot
+# ar publikt, sa minuterna ar gratis. Byt inte heller jobbets name: utan att andra den
+# obligatoriska checken i samma svep - check-namnet ar jobbets name.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prov-bygg-ur-repot-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prov:
+    name: bygg-databasen-ur-repot
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: supabase/prov
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: supabase/prov/package-lock.json
+
+      - name: Installera PGlite (exakt version ur package-lock.json)
+        run: npm ci
+
+      # Exitkoden ar domen. Skriptet satter 1 vid varje sats som faller (utom den namngivna
+      # tillatelselistan), vid noll filer och vid noll korda satser. raise warning lyfts som
+      # ::warning:: men underkanner inte.
+      - name: Bygg schema.sql + migrationerna i en tom databas
+        run: node bygg-ur-repot.mjs ..
