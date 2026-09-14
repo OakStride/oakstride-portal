@@ -206,6 +206,7 @@ do $x$ begin
   if not exists (select 1 from pg_roles where rolname='authenticated') then create role authenticated nologin; end if;
   if not exists (select 1 from pg_roles where rolname='service_role') then create role service_role nologin; end if;
   if not exists (select 1 from pg_roles where rolname='supabase_auth_admin') then create role supabase_auth_admin nologin; end if;
+  if not exists (select 1 from pg_roles where rolname='supabase_storage_admin') then create role supabase_storage_admin nologin; end if;
 end $x$;
 create table if not exists auth.users (
   id uuid primary key default gen_random_uuid(),
@@ -237,18 +238,18 @@ create or replace function storage.extension(name text) returns text
 // Efterliknar rollen postgres i drift, matt 2026-09-14:
 //   rolsuper=false, rolcreaterole=true, rolcreatedb=true, rolbypassrls=true, rolreplication=true
 //   medlem i anon, authenticated, service_role (m.fl.)
-//   schemat public ags av pg_database_owner; tabeller och funktioner i public ags av postgres.
+//   schemat public ags av pg_database_owner; databasen ags av postgres; tabeller och
+//   funktioner i public ags av postgres.
 // Varje rattighet utover attributen star har med sitt skal. En rattighet som bara finns for
 // att fa gront, utan motivering mot drift, hor inte hemma har.
 const DRIFTROLL = 'prov_drift_postgres';
 const DRIFTROLL_SQL = `
 create role ${DRIFTROLL} nosuperuser createrole createdb bypassrls replication nologin;
--- Drift: tabeller och funktioner i public ags av postgres (matt 2026-09-14), alltsa kan
--- postgres skapa i public. Hur (databasagare och darmed medlem i pg_database_owner, som ager
--- public - eller en GRANT) ar INTE matt. Samma effekt ges har med en uttrycklig USAGE +
--- CREATE. Supabase ger postgres USAGE pa public (supabase/postgres init-scripts/
--- 00000000000000-initial-schema.sql). Utan raden faller forsta create table i schema.sql.
-grant usage, create on schema public to ${DRIFTROLL};
+-- Drift: databasen ags av postgres och schemat public av pg_database_owner (bada matta
+-- 2026-09-14). Databasagaren ar implicit medlem i pg_database_owner och kan darfor skapa i
+-- public. Samma mekanism har: provrollen far aga databasen. Utan raden faller forsta
+-- create table i schema.sql.
+alter database postgres owner to ${DRIFTROLL};
 `;
 const DRIFTROLL_STUBB_SQL = `
 -- Drift: postgres ar medlem i anon, authenticated och service_role (matt 2026-09-14).
@@ -259,15 +260,12 @@ grant anon, authenticated, service_role to ${DRIFTROLL};
 -- init-scripts/00000000000001-auth-schema.sql).
 alter table auth.users owner to supabase_auth_admin;
 
--- storage.objects ags av driftrollen. HARLEDD, INTE MATT: create policy kraver att man ager
--- tabellen (ingen GRANT racker), och drift HAR de tre policies migration 19 skapar pa
--- storage.objects - de ingar i objektlistans 114 objekt och md5 cb8e3bea... (utan dem blir
--- det 111). postgres ar inte superuser och inte medlem i supabase_storage_admin (matt
--- 2026-09-14), sa i drift maste postgres aga storage.objects. Utan raden faller migration 19
--- med "must be owner of table objects". Kontrollera mot drift med:
---   select tableowner from pg_tables where schemaname='storage' and tablename='objects';
--- Visar den nagot annat an postgres ar raden fel och ska bort.
-alter table storage.objects owner to ${DRIFTROLL};
+-- Drift: storage.objects ags av supabase_storage_admin, och postgres ar INTE medlem i den
+-- rollen (pg_has_role(...,'MEMBER') = false, matt 2026-09-14). Samma har: provrollen far
+-- inte grant supabase_storage_admin. Att migration 19 anda kan skapa policies pa
+-- storage.objects i drift beror pa supautils - se SUPAUTILS_TABELLER nedan.
+alter table storage.buckets owner to supabase_storage_admin;
+alter table storage.objects owner to supabase_storage_admin;
 
 -- Rattigheterna nedan ar ORDAGRANT de Supabase ger postgres nar rollen degraderas fran
 -- superuser: supabase/postgres migrations/db/migrations/10000000000000_demote-postgres.sql
@@ -277,11 +275,60 @@ alter table storage.objects owner to ${DRIFTROLL};
 -- on_auth_user_created pa auth.users (TRIGGER) i schema.sql, samt insert i storage.buckets
 -- i migration 19. Utan dem faller schema.sql med "permission denied for schema auth", vilket
 -- den inte gor i drift.
+-- For storage.buckets och storage.objects ger Supabase dessutom uttryckligen ALL till
+-- postgres i storage-api:s egna migrationer (supabase/storage migrations/tenant/
+-- 0046-buckets-objects-grants.sql och 0049-buckets-objects-grants-postgres.sql:
+-- "grant all on storage.buckets, storage.objects to postgres with grant option").
+-- ALL innefattar TRIGGER, sa "create trigger ... on storage.objects" gar igenom har.
+-- OMATT i drift: kontrollera med
+--   select has_table_privilege('postgres', 'storage.objects', 'TRIGGER');
+-- Ger den false ska storage-grants snavas av till det migration 19 behover.
 grant all on schema auth, extensions, storage to ${DRIFTROLL};
 grant all on all tables in schema auth, extensions, storage to ${DRIFTROLL};
 grant all on all sequences in schema auth, extensions, storage to ${DRIFTROLL};
 grant all on all routines in schema auth, extensions, storage to ${DRIFTROLL};
 `;
+
+// ------------------------------------------------------------------- supautils-grants
+// Drift har tillagget supautils, som later postgres skapa, andra och ta bort POLICY - och ta
+// bort TRIGGER - pa vissa plattformstabeller utan att aga dem. Listan ar ORDAGRANT
+// installningarna supautils.policy_grants och supautils.drop_trigger_grants for "postgres",
+// matta i drift 2026-09-14 (de tva listorna var identiska). Allt ANNAT mot tabellerna -
+// alter table ... add column, create trigger, enable rls - faller i drift, och ska falla har.
+//
+// Efterlikningen: en sats vars form sakert ar create/alter/drop policy ... on <schema>.<tabell>
+// (eller drop trigger ... on <schema>.<tabell>) med tabellen i listan kors av skriptet som
+// superuser (reset role), och rollen sats tillbaka direkt efter, aven om satsen faller.
+// Tolkningen ar KONSERVATIV: tabellen maste vara schemakvalificerad och satsen maste matcha
+// formen exakt. Kan den inte avgoras kors satsen som provrollen - ett onodigt rott ar battre
+// an ett falskt gront. Filens egen `reset role` ar aldrig en sadan form och fangas av vakten.
+const SUPAUTILS_TABELLER = [
+  'auth.audit_log_entries', 'auth.flow_state', 'auth.identities', 'auth.instances',
+  'auth.mfa_amr_claims', 'auth.mfa_challenges', 'auth.mfa_factors', 'auth.oauth_clients',
+  'auth.one_time_tokens', 'auth.refresh_tokens', 'auth.saml_providers', 'auth.saml_relay_states',
+  'auth.sessions', 'auth.sso_domains', 'auth.sso_providers', 'auth.users',
+  'realtime.messages', 'realtime.subscription',
+  'storage.buckets', 'storage.buckets_analytics', 'storage.objects', 'storage.prefixes',
+  'storage.s3_multipart_uploads', 'storage.s3_multipart_uploads_parts',
+];
+const POLICY_GRANTS = new Set(SUPAUTILS_TABELLER);
+const DROP_TRIGGER_GRANTS = new Set(SUPAUTILS_TABELLER);
+
+const IDENT = String.raw`(?:"(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)`;
+const POLICY_FORM = new RegExp(String.raw`^(?:create|alter|drop)\s+policy\s+(?:if\s+exists\s+)?${IDENT}\s+on\s+(${IDENT})\s*\.\s*(${IDENT})(?:\s|$)`, 'i');
+const DROP_TRIGGER_FORM = new RegExp(String.raw`^drop\s+trigger\s+(?:if\s+exists\s+)?${IDENT}\s+on\s+(${IDENT})\s*\.\s*(${IDENT})(?:\s+(?:cascade|restrict))?$`, 'i');
+function namn(id) {
+  return id.startsWith('"') ? id.slice(1, -1).replace(/""/g, '"') : id.toLowerCase();
+}
+// Returnerar tabellen om satsen far koras med supautils-rattighet, annars null.
+function supautilsGrant(sats) {
+  const norm = utanKommentarer(sats);
+  let m = POLICY_FORM.exec(norm);
+  if (m) { const t = `${namn(m[1])}.${namn(m[2])}`; return POLICY_GRANTS.has(t) ? t : null; }
+  m = DROP_TRIGGER_FORM.exec(norm);
+  if (m) { const t = `${namn(m[1])}.${namn(m[2])}`; return DROP_TRIGGER_GRANTS.has(t) ? t : null; }
+  return null;
+}
 
 // ----------------------------------------------------------------- inventering (drift)
 // SAMMA uttryck som receptets drift-SQL, tecken for tecken i det som raknas och sorteras,
@@ -340,11 +387,11 @@ async function kor() {
   console.log(`Kör som: ${jag.u} (is_superuser=${jag.su})`);
   console.log(`Ordning (${filer.length} filer): ${filer.join(', ')}\n`);
 
-  let totalt = 0, gronaTotalt = 0, tillatnaTotalt = 0;
+  let totalt = 0, gronaTotalt = 0, tillatnaTotalt = 0, supautilsSatser = 0;
   for (const f of filer) {
     const { satser, oavslutat } = delaSatser(readFileSync(path.join(SQLDIR, f), 'utf8'));
     let grona = 0;
-    const fel = [], tillatna = [];
+    const fel = [], tillatna = [], medGrant = [];
     if (oavslutat) fel.push({ nr: 'filslut', kort: '(hela filen)', fel: oavslutat });
     if (satser.length === 0) fel.push({ nr: '-', kort: '(hela filen)', fel: 'filen ger noll satser - ett prov som inte provade nagot ar inte gront' });
 
@@ -357,14 +404,26 @@ async function kor() {
         fel.push({ nr, kort, fel: 'egen transaktionskontroll i filen - kor-migrationer.yml kor filen med psql -1 och provet kan inte efterlikna det troget' });
         continue;
       }
+      // Skriptets EGEN rollvaxling for supautils-satser. Tillbaka till provrollen direkt efter
+      // satsen, fore vakten - sa att vakten bara kan se en vaxling som filen sjalv gjort.
+      const grant = NAKET ? null : supautilsGrant(s);
+      if (grant) { supautilsSatser++; medGrant.push(`sats ${nr} (${grant})`); }
       await db.exec('savepoint sats');
       try {
-        await db.exec(s, { onNotice });
+        if (grant) await db.exec('reset role');
+        try {
+          await db.exec(s, { onNotice });
+        } finally {
+          // Faller satsen ar transaktionen avbruten och set role gar inte - da aterstaller
+          // rollback to savepoint rollen, och set role kors igen efter den nedan.
+          if (grant) { try { await db.exec(`set role ${DRIFTROLL}`); } catch { /* se ovan */ } }
+        }
         await db.exec('release savepoint sats');
         grona++;
       } catch (e) {
         await db.exec('rollback to savepoint sats');
         await db.exec('release savepoint sats');
+        if (grant) await db.exec(`set role ${DRIFTROLL}`);
         const t = tillatet(s);
         if (t) tillatna.push({ nr, kort, fel: e.message.split('\n')[0], skal: t.skal });
         else fel.push({ nr, kort, fel: e.message.split('\n')[0] });
@@ -389,6 +448,7 @@ async function kor() {
       annotera('error', f, `sats ${x.nr}: ${x.fel} -- ${x.kort}`);
       underkant.push(`${f} sats ${x.nr}: ${x.fel}`);
     }
+    if (medGrant.length) console.log(`       supautils-grant (körd som superuser, som i drift): ${medGrant.join(', ')}`);
     for (const x of tillatna) {
       console.log(`       tillåtet fel sats ${x.nr}: ${x.fel}\n           ${x.kort}\n           skäl: ${x.skal}`);
     }
@@ -413,7 +473,7 @@ async function kor() {
   const kolumner = (await db.query(SQL_KOLUMNER)).rows[0];
 
   console.log('\n=== SUMMERING ===');
-  console.log(`filer ${filer.length} · satser ${totalt} · gröna ${gronaTotalt} · tillåtna fel ${tillatnaTotalt} · fel ${totalt - gronaTotalt - tillatnaTotalt}`);
+  console.log(`filer ${filer.length} · satser ${totalt} · gröna ${gronaTotalt} · tillåtna fel ${tillatnaTotalt} · fel ${totalt - gronaTotalt - tillatnaTotalt} · körda med supautils-grant ${supautilsSatser}`);
   console.log('\n=== INVENTERING (jämför mot drift för hand, se README.md) ===');
   console.log(`funktioner i public:           ${inv.funktioner_public}`);
   console.log(`policies i public+storage:     ${inv.policies_public_storage}`);
