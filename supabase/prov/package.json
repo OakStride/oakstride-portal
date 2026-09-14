@@ -1,0 +1,13 @@
+{
+  "name": "oakstride-portal-prov-bygg-ur-repot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Prov: bygg portalens databas ur repots SQL i en tom PostgreSQL (PGlite). Se README.md.",
+  "type": "module",
+  "scripts": {
+    "prov": "node bygg-ur-repot.mjs .."
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "0.5.8"
+  }
+}
