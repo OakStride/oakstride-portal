@@ -172,11 +172,83 @@
         return Array.prototype.map.call(new Uint8Array(h), function (b) {
           return ("0" + b.toString(16)).slice(-2);
         }).join("");
+      // 🔴 RATTAT 2026-09-06 (#66, fynd 2, halva tva). `try/catch` fangar bara
+      // SYNKRONA fel. Avvisades `digest()` ASYNKRONT - ovanligt men mojligt, t.ex.
+      // med ett blockerande tillagg - fyrade `.then()` i anroparna ALDRIG.
+      //
+      // Foljden for kunden: i tva av tre anropsstallen ar godkann-knappen redan
+      // satt till disabled nar anropet gors, sa den blev PERMANENT GRA utan
+      // felmeddelande. Det tredje (approveUpdatedOffer) fyras av en kryssruta som i
+      // stallet blir staende ikryssad utan att nagot hander.
+      //
+      // ⚠️ En tidigare version av den har kommentaren skrev "alla tre" om den
+      // disablade knappen. Fel - hålet var gemensamt, symtomet inte.
+      // Darfor sitter fixen i funktionen och inte i tre kopior.
+      }).catch(function (e) {
+        // ⚠️ Fallbacken bytte en SYNLIG hangning mot en TYST falsk kontrollsumma pa
+        // ett juridiskt dokument - samma feltyp svepet ska ta bort. Att blockera
+        // godkannandet ar Fredriks beslut (k-20260906-01) och tas inte har, men
+        // TYSTNADEN ar inget beslut: den bort oavsett vad han svarar.
+        //
+        // 🔴 RATTAT TVA GANGER. Forsta forsoket toastade harifran. Granskaren matte
+        // att den toasten ALLTID skrivs over: alla tre anropsstallen fortsatter till en
+        // insert som pa lyckad vag toastar "Tack!", och `toast()` har ETT element och EN
+        // delad timer. Efter en round-trip var varningen borta - alltsa exakt den
+        // tystnad raderna ovan sager sig ta bort.
+        //
+        // 👉 Samma monsterfel som i loadPricing, en niva upp: jag valde en KANAL
+        // utan att kontrollera var den landar. Varningen hor hemma i kvittot kunden
+        // laser, inte i en ruta som kvittot skriver over 200 ms senare.
+        if (window.console && console.warn) console.warn("[oakstride] sha256:", e);
+        return "nohash-" + str.length;
       });
     } catch (e) {
+      // ⚠️ Den SYNKRONA grenen (crypto.subtle saknas helt) hade kvar tystnaden
+      // aven efter forsta rattningen - granskarens fynd B. Den delar nu markor och
+      // console.warn med den asynkrona, sa `hashSaknas()` nedan fangar bada.
+      if (window.console && console.warn) console.warn("[oakstride] sha256 (synkront):", e);
       return Promise.resolve("nohash-" + str.length);
     }
   }
+
+  // Markoren fran sha256Hex fallback. Bada grenarna returnerar "nohash-<längd>", sa
+  // anroparen kan se att dokumentets kontrollsumma ar en platshallare - utan nagon
+  // delad flagga. Kvittotexten sager det i stallet for att latsas om saken.
+  function hashSaknas(hash) {
+    return typeof hash === "string" && hash.indexOf("nohash-") === 0;
+  }
+  // 🔴 TILLAGT efter granskningens omgang 3. `hashSaknas(hash)` ensam ar FEL
+  // signal i kvittot: den laser klientens nyberaknade hash, och enda vagen som inte
+  // returnerar tidigt ar 23505 - alltsa "raden fanns redan, INGENTING skrevs".
+  // agreement_acceptances har unique (user_id, agreement_version), sa 23505 ar inte
+  // exotiskt: approveUpdatedOffer fyras vid varje uppdaterad offert och
+  // villkorsversionen ar ofta densamma.
+  //
+  // Da blir bada riktningarna fel (uppmatt av granskaren i en korning av filen):
+  //   godkant forr med riktig hash, aterkommer i trasig webblasare
+  //     -> 23505 -> kvittot pastar att kontrollsumman saknas. Falskt larm.
+  //   godkant forr med nohash-, aterkommer i frisk webblasare
+  //     -> 23505 -> kvittot tiger. Raden saknar fortfarande kontrollsumma.
+  //
+  // Vi kan bara uttala oss om en rad vi SJALVA skrev. Skrevs ingen: sag inget om
+  // kontrollsumman - varningen gavs vid det tillfalle raden faktiskt skrevs.
+  //
+  // ⚠️ Den sista meningen galler bara om det inte redan LIGGER rader utan
+  // kontrollsumma i drift - sadana skrevs av kod som antingen inte varnade alls
+  // eller varnade i en toast som skrevs over. For dem skulle 23505-vagen tiga for
+  // alltid. Darfor ar den matt och inte antagen, 2026-09-06:
+  //
+  //   select count(*) filter (where document_hash like 'nohash-%') ... -> 0 av 1 rad
+  //
+  // Noll. Resonemanget ar alltsa belagt i dag. Blir det nagon gang mer an noll ar
+  // koden fortfarande ratt, men da finns kunder vars godkannande saknar
+  // kontrollsumma utan att portalen sager det - och det ar ett eget arende till
+  // Fredrik, skilt fran k-20260906-01 som handlar om att blockera framat.
+  function hashNotis(res, hash) {
+    var skrevs = !(res && res.error);       // 23505 = fanns redan, inget skrevs
+    return (skrevs && hashSaknas(hash)) ? HASH_NOTIS : "";
+  }
+  var HASH_NOTIS = " OBS: kontrollsumman för avtalet kunde inte beräknas i din webbläsare, så godkännandet saknar den. Hör av dig till OakStride så noterar vi det.";
 
   // 5-stegsflödet. form: steg 1 klart via projektförfrågan. offer: steg 3 = godkänn
   // kravspec/offert + villkor + faktureringsuppgifter. site: steg 4 = godkänn sida & konfig.
@@ -665,11 +737,26 @@
 
   function loadPricing() {
     return sb.from("pricing_settings").select("*").eq("id", 1).maybeSingle().then(function (r) {
-      if (r && r.data) {
-        pricing = { site_price: Number(r.data.site_price), drift_month: Number(r.data.drift_month), rate_setup: Number(r.data.rate_setup), rate_change: Number(r.data.rate_change) };
-        AGREEMENT = buildAgreement(pricing);
+      // 🔴 RATTAT TVA GANGER. Forsta forsoket lade kontrollen i `.then(ok, FEL)`:s
+      // andra argument. Men en PostgREST-builder AVVISAR ALDRIG utan
+      // `throwOnError()` - den resolvar alltid med {data, error}, aven vid
+      // natverksfel. Den grenen kordes darfor aldrig, och buggen var oforandrad
+      // medan bade kommentaren och PR-texten pastod att den var lagad.
+      //
+      // Uppmatt av granskaren mot en onabar host: RESOLVED -> data=null,
+      // error=TypeError: fetch failed.
+      //
+      // 👉 Lardomen ar storre an raden: jag applicerade "kolla .error" som ett
+      // MONSTER utan att kontrollera VAR signalen dyker upp. Kontrollen hor hemma
+      // i success-handlern, dar svaret faktiskt landar.
+      if (!r || r.error || !r.data) {
+        toast("Kunde inte hämta aktuella priser — siffrorna kan vara inaktuella. Ladda om sidan innan du godkänner något.", true);
+        if (window.console && console.warn) console.warn("[oakstride] pricing_settings:", r && r.error);
+        return;
       }
-    }, function () {});
+      pricing = { site_price: Number(r.data.site_price), drift_month: Number(r.data.drift_month), rate_setup: Number(r.data.rate_setup), rate_change: Number(r.data.rate_change) };
+      AGREEMENT = buildAgreement(pricing);
+    });
   }
 
   function loadProfileAndRoute() {
@@ -710,6 +797,18 @@
 
   // ---------- Villkorsgodkännande (inuti flödet) ----------
 
+  // 🚧 ANROPAS INTE FRAN NAGOT HALL. Kontrollerat 2026-09-06 med grep over
+  // hela repot: enda traffen ar den har definitionsraden. Steg 2:s kryssruta gar
+  // till checkoffStep(2) och steg 3:s knapp till approveOffer.
+  //
+  // Funktionen star kvar orord i den har PR:en - att ta bort kod ar en annan
+  // andring an att laga tystnad, och den ska inte smygas in i en fix. Men den ar
+  // MARKT, for annars ar den en falla: nasta person som ska rora
+  // villkorsgodkannandet laser den har funktionen, tror sig ha hittat vagen, och
+  // lagger sin andring dar ingen kund kommer.
+  //
+  // Mitt eget matunderlag "tre av tre kvitton bar notisen" gallde alltsa tre
+  // stallen i KODEN, varav tva ar naabara for en kund. Rattat i PR-texten.
   function acceptTerms(btn) {
     btn.disabled = true;
     sha256Hex(custAgreement.version + "\n" + custAgreement.html).then(function (hash) {
@@ -725,12 +824,19 @@
           if (n) { n.hidden = false; n.className = "status-note error"; n.textContent = "Kunde inte spara: " + res.error.message; }
           btn.disabled = false; return;
         }
-        toast("Tack! Villkoren är godkända.");
+        toast("Tack! Villkoren är godkända." + hashNotis(res, hash), !!hashNotis(res, hash));
         loadOnboarding();
       });
     });
   }
 
+  // 🚧 ANROPAS INTE FRAN NAGOT HALL - samma sak som acceptTerms ovan, och
+  // markt av samma skal. Granskningen pekade pa att markera det ena men inte det
+  // andra ger markeringen fel innebord: nasta lasare drar da slutsatsen att en
+  // OMARKT funktion ar levande. Kontrollerat 2026-09-06, en enda forekomst i repot.
+  //
+  // Den har ar dessutom den farligaste av de tva att missta for levande kod - den
+  // ser ut som villkorsvyns ingang och ror `custAgreement`.
   function renderTermsView(back) {
     main.innerHTML =
       '<button class="back-link" id="btn-back">&larr; Tillbaka</button>' +
@@ -826,6 +932,14 @@
       // Gå in i "agera som kund"-läge: hämta kunderna, välj den första, visa kundvyn.
       sb.from("profiles").select("id, full_name, company, email, website")
         .eq("is_admin", false).order("company", { ascending: true }).then(function (res) {
+          // 🔴 RATTAT 2026-09-06 (#66, fynd 8). `res.error` lastes aldrig, sa ett
+          // FRAGEFEL rapporterades som "det finns inga kunder" - sakligt fel, och en
+          // admin som litar pa texten kan tro att databasen ar tom.
+          if (res && res.error) {
+            toast("Kunde inte hämta kundlistan: " + (res.error.message || "okänt fel") +
+                  ". Det betyder INTE att listan är tom.", true);
+            return;
+          }
           actingCustomers = (res.data || []).filter(function (c) { return c && c.id; });
           if (!actingCustomers.length) { toast("Det finns inga kunder att agera som ännu.", true); return; }
           viewAsCustomer = true;
@@ -1206,6 +1320,19 @@
     var box = document.getElementById("aichat-usage"); if (!box) return;
     sb.rpc("ai_usage_this_month").then(function (res) {
       if (!box.isConnected) return;
+      // 🔴 RATTAT 2026-09-06 (issue #66, fynd 4). `res.error` lastes inte. Vid fel
+      // blev `d = {}` -> used 0, cap 15 -> rutan visade "15 av 15 andringar kvar",
+      // alltsa en fullstandigt frisk siffra, identisk med en ny manad utan
+      // forbrukning. Kunden kunde tro att hela kvoten fanns kvar och bli forvanad
+      // nar nasta forsok stoppades.
+      //
+      // Sjalva spärren sitter i request_ai_draft-RPC:n, sa taket kringgas inte -
+      // det ar informationen som ljuger, inte skyddet.
+      if (res && res.error) {
+        box.className = "aichat-usage";
+        box.innerHTML = "&#9888;&#65039; Kunde inte hämta hur många AI-ändringar du har kvar den här månaden. Siffran visas igen när sidan laddas om.";
+        return;
+      }
       var d = (res && res.data) || {};
       var used = Number(d.used || 0), cap = Number(d.cap || 15);
       var left = Math.max(0, cap - used);
@@ -1266,7 +1393,7 @@
   }
 
   function sendAIChat(cp, active) {
-    if (typeof previewBlocked === "function" && previewBlocked()) return;
+    if (previewBlocked()) return;
     var ta = document.getElementById("aichat-msg"); if (!ta) return;
     var msg = (ta.value || "").trim(); if (!msg) return;
     var btn = document.querySelector("#aichat-form button"); if (btn) { btn.disabled = true; btn.textContent = "Skickar…"; }
@@ -1290,7 +1417,7 @@
 
   // Kunden lanserar utkastet direkt på livesajten (utan admin-granskning).
   function publishChange(active, cp) {
-    if (typeof previewBlocked === "function" && previewBlocked()) return;
+    if (previewBlocked()) return;
     if (!window.confirm("Lansera ändringen direkt på din livesajt?\n\nDen publiceras utan OakStrides granskning.")) return;
     sb.rpc("request_publish_change", { p_request_id: active.id }).then(function (r) {
       if (r.error || (r.data && r.data.ok === false)) {
@@ -1304,7 +1431,7 @@
 
   // Kunden ber OakStride granska & publicera (draft_ready → approved).
   function requestReview(active, cp) {
-    if (typeof previewBlocked === "function" && previewBlocked()) return;
+    if (previewBlocked()) return;
     sb.from("requests").update({ status: "approved" }).eq("id", active.id).then(function (r) {
       if (r.error) { toast("Kunde inte skicka för granskning: " + r.error.message, true); return; }
       toast("Skickat till OakStride för granskning & publicering.");
@@ -1414,15 +1541,66 @@
         });
         Array.prototype.forEach.call(g.querySelectorAll("[data-delimg]"), function (btn) {
           btn.addEventListener("click", function () {
+            // 🔴 TILLAGT 2026-09-06. Raderaknappen saknade forhandslagesvakten som
+            // uppladdningen i samma vy har. Det ar INTE kosmetiskt:
+            //
+            // storage-policyn for DELETE lyder
+            //   foldername[1] = auth.uid() OR is_admin()
+            // och i "visa som kund" ar sessionen fortfarande ADMINENS. `is_admin()`
+            // ar alltsa sant, och raderingen GAR IGENOM pa databassidan. Skyddet kan
+            // darfor bara ligga har i granssnittet.
+            //
+            // 🔴 RATTAT efter granskningens omgang 3 - min forsta kommentar
+            // namngav FEL LAGE, och det ar precis den sortens pastaende som gor att
+            // nasta lasare inte tittar efter. Det finns TVA lagen, inte ett:
+            //   ?preview=<uid>  satter previewUid -> previewBlocked() ar sant
+            //                   -> vakten nedan galler. Det ar det har den stanger.
+            //   knappen "Visa som kund" satter actingUid och lamnar previewUid NULL
+            //                   -> vakten galler INTE, och raderingen gar igenom.
+            // Det andra ar avsiktligt skrivbart (se raderna vid actingUid), sa det ar
+            // ingen bugg att laga i forbigaende - men det ar en oppen fraga om en
+            // admin ska kunna radera kundens bild permanent i det laget. Den ligger
+            // som kort hos Fredrik; utvidga inte vakten sjalv innan han svarat.
+            //
+            // Uppmatt i pg_policies 2026-09-06. Skydd finns bara i granssnittet,
+            // sa det maste finnas HAR.
+            // ⚠️ `typeof previewBlocked === "function" &&` stod har forst. Det ar en
+            // vakt som FALLER OPPET: forsvinner funktionen (namnbyte, filsplit) blir
+            // villkoret tyst falskt och raderingen gar igenom - precis det beteende
+            // vakten skrevs for att stanga. Funktionen ar en deklaration i samma
+            // slutning och alltsa alltid definierad - villkoret skyddade ingenting
+            // och kunde bara dolja ett fel.
+            //
+            // Samma form fanns pa FYRA andra stallen i filen (uppladdningen i samma
+            // vy, plus tre till) och ar borttagen dar ocksa. En rattelse som bara
+            // nar ett stalle ar precis det monster den har PR:en handlar om.
+            if (previewBlocked()) return;
             if (!window.confirm("Ta bort bilden?")) return;
-            bucket.remove([btn.getAttribute("data-delimg")]).then(function () { renderGallery(); });
+            // 🔴 RATTAT 2026-09-06 (#66, fynd 6). Inget felläge kollades. Misslyckades
+            // borttagningen renderades galleriet bara om - bilden lag kvar, utan ett ord
+            // om varfor "Ta bort" inte gjorde nagot. Kunden klickar da igen, och igen.
+            // ⚠️ `remove()` returnerar {data: [raderade objekt], error: null}. RLS pa
+            // storage ar en `using`-policy, alltsa ETT FILTER: blockeras raderingen
+            // far man `data: []` och inget fel. Att bara kolla `error` hade lamnat
+            // exakt symtomet kommentaren sager sig laga.
+            bucket.remove([btn.getAttribute("data-delimg")]).then(function (res) {
+              if (res && !res.error && !(res.data && res.data.length)) {
+                toast("Bilden kunde inte tas bort — den ligger kvar. Kontakta OakStride om det upprepas.", true);
+                return;
+              }
+              if (res && res.error) {
+                toast("Bilden kunde inte tas bort: " + (res.error.message || "okänt fel") + ". Den ligger kvar.", true);
+                return;
+              }
+              renderGallery();
+            });
           });
         });
       });
     }
 
     document.getElementById("up-input").addEventListener("change", function (e) {
-      if (typeof previewBlocked === "function" && previewBlocked()) return;
+      if (previewBlocked()) return;
       var files = Array.prototype.slice.call(e.target.files || []);
       if (!files.length) return;
       var st = document.getElementById("up-status");
@@ -1725,8 +1903,26 @@
         document_hash: hash, user_agent: navigator.userAgent, order_summary: summary
       }).then(function (r2) {
         if (r2.error && r2.error.code !== "23505") { toast("Kunde inte spara: " + r2.error.message, true); return; }
-        sb.from("extra_work_approvals").insert({ user_id: cuid(), spec_version: spec.version }).then(function () {
-          toast("Tack! Den uppdaterade offerten är godkänd — en ny orderbekräftelse skickas.");
+        // 🔴 TILLAGT efter tystnadsgranskning (blockerande fynd 1). Callbacken
+        // tog INGET argument - `res.error` lastes aldrig. Tabellen har primarnyckel
+        // (user_id, spec_version), sa ett dubbelklick ger en realistisk 23505; men
+        // VILKET fel som helst svaldes likadant, for koden kollade inte ens koden.
+        //
+        // Foljden: kunden sag "Tack! ... en ny orderbekraftelse skickas" medan raden -
+        // sjalva BEVISET for godkannandet - aldrig skrevs. Ingen toast, ingen
+        // console.warn, ingen loggrad. Samma tabell har en annan insert-plats i den
+        // har filen, saveExtraApproval, som gor det ratt sedan tidigare.
+        //
+        // 23505 ar avsiktlig idempotens (redan godkant), inte ett svalt fel.
+        sb.from("extra_work_approvals").insert({ user_id: cuid(), spec_version: spec.version }).then(function (r3) {
+          if (r3 && r3.error && r3.error.code !== "23505") {
+            toast("Godkännandet kunde inte registreras: " + (r3.error.message || "okänt fel") +
+                  ". Försök igen, eller hör av dig till OakStride.", true);
+            if (window.console && console.warn) console.warn("[oakstride] extra_work_approvals:", r3.error);
+            return;
+          }
+          toast("Tack! Den uppdaterade offerten är godkänd — en ny orderbekräftelse skickas." +
+                hashNotis(r2, hash), !!hashNotis(r2, hash));
           loadOnboarding();
         });
       });
@@ -1750,8 +1946,18 @@
           document_hash: hash, user_agent: navigator.userAgent, order_summary: summary
         }).then(function (r2) {
           if (r2.error && r2.error.code !== "23505") { toast("Kunde inte spara godkännande: " + r2.error.message, true); btn.disabled = false; return; }
-          sb.from("extra_work_approvals").insert({ user_id: cuid(), spec_version: spec.version }).then(function () {
-            toast("Tack! Offert och villkor godkända — en orderbekräftelse skickas till din e-post.");
+          // 🔴 TILLAGT efter tystnadsgranskning (blockerande fynd 1) - samma
+          // ovakade insert som i approveUpdatedOffer, har med btn kvar att aterstalla.
+          sb.from("extra_work_approvals").insert({ user_id: cuid(), spec_version: spec.version }).then(function (r3) {
+            if (r3 && r3.error && r3.error.code !== "23505") {
+              toast("Godkännandet kunde inte registreras: " + (r3.error.message || "okänt fel") +
+                    ". Försök igen, eller hör av dig till OakStride.", true);
+              if (window.console && console.warn) console.warn("[oakstride] extra_work_approvals:", r3.error);
+              btn.disabled = false;
+              return;
+            }
+            toast("Tack! Offert och villkor godkända — en orderbekräftelse skickas till din e-post." +
+                  hashNotis(r2, hash), !!hashNotis(r2, hash));
             loadOnboarding();
           });
         });
@@ -1972,7 +2178,14 @@
       sb.from("requests").select("*, owner:profiles!requests_user_id_fkey(full_name,email,company,website)").eq("id", id).single(),
       sb.from("request_comments").select("*, author:profiles!request_comments_author_id_fkey(full_name,email,is_admin)").eq("request_id", id).order("created_at")
     ]).then(function (out) {
-      var r = out[0].data, comments = out[1].data || [];
+      // 🔴 RATTAT 2026-09-06 (issue #66, fynd 5). `out[1].error` lastes aldrig.
+      // En misslyckad hamtning gav `comments = []`, som renderas som "Inga
+      // meddelanden annu." - exakt som ett arende utan svar. En kund som vantar pa
+      // besked kunde alltsa se en tom trad och tro att ingen svarat, och skriva
+      // igen. `kommentarerFel` bars ned till renderingen i stallet.
+      var r = out[0].data;
+      var kommentarerFel = !!(out[1] && out[1].error);
+      var comments = (out[1] && out[1].data) || [];
       if (out[0].error || !r) { toast("Kunde inte hämta ärendet.", true); isAdmin ? renderAdmin() : renderCustomer(); return; }
       var labels = isAdmin ? STATUS_LABELS_ADMIN : STATUS_LABELS;
       var statusControl = isAdmin
@@ -2049,7 +2262,9 @@
           return '<div class="comment' + cls + '">' +
             '<div class="comment-head"><span class="who">' + esc(who) + "</span> · " + fmtDate(c.created_at) + "</div>" +
             '<div class="comment-body">' + esc(c.body) + "</div></div>";
-        }).join("") : '<p class="muted">Inga meddelanden ännu.</p>') +
+        }).join("") : (kommentarerFel
+             ? '<p class="status-note error">Meddelandena kunde inte hämtas — det här är <strong>inte</strong> samma sak som att inga finns. Ladda om sidan.</p>'
+             : '<p class="muted">Inga meddelanden ännu.</p>')) +
         "</div>" +
         '<form id="form-comment"><label for="c-body">Skriv ett meddelande</label>' +
         '<textarea id="c-body" required placeholder="Ställ en fråga eller lämna mer information…"></textarea>' +
@@ -2061,8 +2276,24 @@
       if (btnApprove) {
         btnApprove.addEventListener("click", function () {
           btnApprove.disabled = true;
-          sb.from("requests").update({ status: "approved" }).eq("id", id).then(function (res) {
+          // 🔴 TILLAGT efter granskning. PR:en skrev sjalv fjorton rader ned att en
+          // USING-filtrerad update inte felar - och lamnade den mest kundnara
+          // uppdateringen orord. Har racker dessutom INTE radrakning:
+          // `protect_request_cols` (migration-2) ar en BEFORE UPDATE-trigger som for
+          // en icke-admin gor `new := old` nar status inte ar draft_ready. Da
+          // LYCKAS uppdateringen, traffar 1 rad, ger inget fel - och ingenting
+          // andrades. Enda satt att veta ar att LASA TILLBAKA statusen.
+          sb.from("requests").update({ status: "approved" }).eq("id", id).select("status").then(function (res) {
             if (res.error) { toast("Kunde inte godkänna: " + res.error.message, true); btnApprove.disabled = false; return; }
+            var nyStatus = (res.data && res.data[0]) ? res.data[0].status : null;
+            if (nyStatus !== "approved") {
+              // `labels` ar STATUS_LABELS for kunden - utan den skrevs den rana
+              // enum-koden ut i kundvand text ("waiting_customer").
+              toast("Godkännandet gick inte igenom — ärendet står kvar som " +
+                    (nyStatus ? (labels[nyStatus] || nyStatus) : "oförändrat") +
+                    ". Ladda om sidan och försök igen.", true);
+              btnApprove.disabled = false; return;
+            }
             toast("Tack! Förslaget är godkänt — vi publicerar inom kort.");
             renderDetail(id, isAdmin);
           });
@@ -2075,8 +2306,33 @@
           btnAgent.disabled = true;
           sb.from("agent_jobs").insert({ request_id: id, reason: "draft" }).then(function (res) {
             if (res.error) { toast("Kunde inte starta Claude: " + res.error.message, true); btnAgent.disabled = false; return; }
-            sb.from("requests").update({ status: "in_progress" }).eq("id", id).then(function () {
-              toast("Skickat till Claude — utkast eller frågor dyker upp i dialogen.");
+            // 🔴 RATTAT 2026-09-06 (#66, fynd 7). Hanteraren tog INGET argument - aven
+            // en misslyckad uppdatering gav samma lyckade toast. Jobbet skapades, men
+            // `requests.status` blev kvar pa t.ex. `new`, och ingen fick veta det.
+            //
+            // ⚠️ `.select("id")` av samma skal som i renderAccount: en USING-filtrerad
+            // update FELAR INTE, den traffar noll rader.
+            //
+            // Matprotokollet, sa att pastaendet har en kalla om ett halvar (granskningens
+            // N8 - ett 'uppmatt' utan protokoll ar ett pastaende, inte en matning):
+            //
+            //   begin;
+            //   set local role authenticated;
+            //   set local request.jwt.claims = '{"sub":"...0042","role":"authenticated"}';
+            //   update public.profiles set full_name = '...' where id = <annan anvandares rad>
+            //   returning id;
+            //   rollback;
+            //
+            // Utfall 2026-09-06 mot driftdatabasen: 0 andrade rader, ingen felkod.
+            sb.from("requests").update({ status: "in_progress" }).eq("id", id).select("id").then(function (up) {
+              var skrivna = (up && up.data) ? up.data.length : 0;
+              if ((up && up.error) || !skrivna) {
+                toast("Claude är startad, men ärendets status kunde inte sättas till pågående" +
+                      ((up && up.error) ? (": " + up.error.message) : " (ingen rad ändrades)") +
+                      ". Rätta statusen för hand.", true);
+              } else {
+                toast("Skickat till Claude — utkast eller frågor dyker upp i dialogen.");
+              }
               renderDetail(id, isAdmin);
             });
           });
@@ -2085,8 +2341,28 @@
 
       if (isAdmin) {
         document.getElementById("d-status").addEventListener("change", function (e) {
-          sb.from("requests").update({ status: e.target.value }).eq("id", id).then(function (res) {
-            if (res.error) toast("Kunde inte uppdatera status: " + res.error.message, true);
+          // 🔴 RATTAT efter granskning (fynd C). Har lag samma konstruktion som
+          // jag just lagade tjugo rader ovanfor: policyn "requests: admin uppdaterar"
+          // ar `for update using (is_admin())`, alltsa ETT FILTER. Returnerar
+          // is_admin() falskt (profilraden saknas, flaggan avslagen) traffas noll rader
+          // utan fel - och admin far "Status uppdaterad." Lagre insats an kundens
+          // knapp, men samma rad i samma funktion: monstret dar rattelsen bara nadde
+          // ett av stallena.
+          // ⚠️ Radraknining rackte INTE, tvartemot vad jag skrev forst. De tva
+          // UPDATE-policyerna pa requests OR:as: is_admin() ELLER user_id = auth.uid().
+          // Ar is_admin() falskt men adminen rakar aga arendet traffas raden via den
+          // andra policyn, protect_request_cols gor `new := old`, updaten lyckas med
+          // 1 rad - och ingenting andrades. Las darfor tillbaka VARDET, som kundens
+          // knapp gor. (Uppmatt i drift 2026-09-06: triggerkroppen i drift ar identisk
+          // med repots, sa den hoppas over for en akta admin - men det ar just nar
+          // is_admin() ar falskt den har vagen oppnar sig.)
+          var vald = e.target.value;
+          sb.from("requests").update({ status: vald }).eq("id", id).select("status").then(function (res) {
+            var ny = (res && res.data && res.data[0]) ? res.data[0].status : null;
+            if (res && res.error) toast("Kunde inte uppdatera status: " + res.error.message, true);
+            else if (ny !== vald) toast("Statusen ändrades inte — ärendet står kvar som " +
+                  (ny ? (labels[ny] || ny) : "oförändrat") +
+                  ". Ladda om sidan och kontrollera att du fortfarande är inloggad som admin.", true);
             else toast("Status uppdaterad.");
           });
         });
@@ -2326,7 +2602,16 @@
     if (document.getElementById("b-customer")) {
       sb.from("profiles").select("id, company, full_name, email").eq("is_admin", false).order("company", { ascending: true }).then(function (res) {
         var sel = document.getElementById("b-customer");
-        if (!sel || res.error || !res.data) return;
+        if (!sel) return;
+        // 🔴 RATTAT 2026-09-06 (#66, fynd 10). `res.error` gav en TYST retur: admin
+        // sag en tom dropdown, identiskt med det legitima laget "inga kunder annu".
+        if (res.error || !res.data) {
+          var o = document.createElement("option");
+          o.value = ""; o.disabled = true;
+          o.textContent = "— kundlistan kunde inte hämtas, ladda om sidan —";
+          sel.appendChild(o);
+          return;
+        }
         res.data.forEach(function (p) {
           var o = document.createElement("option");
           o.value = p.id;
@@ -2351,6 +2636,14 @@
     }
     sb.from("site_templates").select("*").eq("active", true).order("sort", { ascending: true }).then(function (res) {
       var sel = document.getElementById("b-template");
+      // 🔴 Samma sak for mallistan: vid fel visades bara "Generisk", vilket ser ut
+      // som "inga extra mallar aktiverade". Att bygga en kundsajt pa generisk nar
+      // kunden bestallt en restaurangsajt ar exakt felet studio-kit#2 lagar i
+      // andra anden - har sags det i stallet rakt ut.
+      if (sel && res.error) {
+        toast("Mallistan kunde inte hämtas: " + (res.error.message || "okänt fel") +
+              ". Endast Generisk visas — bygg inte förrän listan går att hämta.", true);
+      }
       if (sel && !res.error && res.data && res.data.length) {
         sel.innerHTML = res.data.map(function (t) { TEMPLATES[t.key] = t; return '<option value="' + esc(t.key) + '">' + esc(t.label) + "</option>"; }).join("");
         sel.addEventListener("change", renderExtra);
@@ -2737,9 +3030,24 @@
         sb.from("site_change_proposals").select("*").eq("user_id", pid).order("created_at"),
         sb.from("build_jobs").select("status, shared_at, preview_url, created_at").eq("customer_id", pid).order("created_at", { ascending: false })
       ]).then(function (out) {
-      var addons = out[0].data || [];
-      var done = {}, doneExtras = {}; (out[1].data || []).forEach(function (r) { done[r.step_no] = r.done_at; doneExtras[r.step_no] = r.with_extras; });
-      var requests = out[2].data || [];
+      // 🔴 RATTAT 2026-09-06 (#66, fynd 9). Sju av tio deltradar i den har
+      // Promise.all kontrollerade `out[n].error`; DE HAR TRE gjorde det inte.
+      // Ett fragefel sag darfor ut som "inga tillagg foreslagna", "inget steg
+      // avklarat" och "inga arenden annu" - och kunde fa en admin att missbedoma
+      // var kunden faktiskt star i sin resa. Nu samma monster som de sju.
+      var addons = out[0].error ? [] : (out[0].data || []);
+      var done = {}, doneExtras = {}; (out[1].error ? [] : (out[1].data || [])).forEach(function (r) { done[r.step_no] = r.done_at; doneExtras[r.step_no] = r.with_extras; });
+      var requests = out[2].error ? [] : (out[2].data || []);
+      // Om nagon av de tre foll ar bilden ofullstandig - sag det, i stallet for att
+      // visa tomma listor som ser ut som ett tomt men friskt lage.
+      // ⚠️ UTOKAT efter granskning. Forsta versionen tackte bara de tre tradar jag
+      // ROR - men foll `out[3]` (project_briefs) blev brief null, step1Done falskt,
+      // och admin sag "steg 1 inte klart" utan ett ord. Sju av tio hade alltsa kvar
+      // exakt den felbedomning kommentaren varnar for. Tacket galler nu alla tio.
+      var falladeTradar = out.filter(function (o) { return o && o.error; }).length;
+      if (falladeTradar) {
+        toast(falladeTradar + " av " + out.length + " delar av kundbilden kunde inte hämtas. Det som visas är OFULLSTÄNDIGT — ladda om innan du drar slutsatser om var kunden står.", true);
+      }
       var briefs = out[3].error ? [] : (out[3].data || []);
       var brief = briefs[0] || null;
       var content = {}; (out[4].error ? [] : (out[4].data || [])).forEach(function (r) { content[r.step_no] = r; });
