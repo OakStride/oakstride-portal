@@ -1,0 +1,2 @@
+# Lagra allt som LF i git oavsett vilken maskin som committar (issue #71).
+* text=auto eol=lf
